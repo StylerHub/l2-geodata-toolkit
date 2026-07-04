@@ -243,6 +243,24 @@ WALK_NZ = 0.5          # |нормаль.z| ≥ 0.5 → пол (склон ≤ 6
 LAYER_MERGE = 24       # слои ближе 24 юнитов сливаются
 CLEARANCE = 64         # под слоем должно быть ≥ 64 юнитов, чтобы там стоять
 WALL_HEAD = 32         # стена мешает проходу, если торчит выше слоя на 32+
+HEADROOM = 176         # над проходимым слоём нужно ≥176ю пустоты (рост персонажа);
+                       # иначе это «толщина» платформы/ступени, а не отдельный уровень
+
+
+def _dilate_cells(cells):
+    """Множество ячеек, расширенное на 1 в 8-окрестности (клип к региону)."""
+    out = set()
+    for cell in cells:
+        gy, gx = divmod(cell, CELLS)
+        for dy in (-1, 0, 1):
+            ny = gy + dy
+            if not 0 <= ny < CELLS:
+                continue
+            for dx in (-1, 0, 1):
+                nx = gx + dx
+                if 0 <= nx < CELLS:
+                    out.add(ny * CELLS + nx)
+    return out
 
 
 def _rasterize(tris, west, north, forced_walls=()):
@@ -376,17 +394,24 @@ def _edge_cross(edges_x, edges_y, A, B, C, west, north):
 
 
 def _merge_layers(zs):
-    """Кандидаты высот → слои (по убыванию): слияние близких и
-    clearance-фильтр — слой существует, только если над ним есть место
-    для персонажа (декор и камни не плодят недосягаемых слоёв)."""
+    """Кандидаты высот → проходимые слои (по убыванию).
+
+    Слой валиден, только если НАД ним есть headroom (место для персонажа):
+    иначе он — «дно» под тонкой платформой/ступенью (толщина конструкции),
+    а не отдельный проходимый уровень. Это отсекает паразитные нижние слои,
+    которые плодят multilayer под мешами и ломают выбор Z в движке.
+    Слои идут сверху вниз; следующий принимается, если он ниже последнего
+    принятого более чем на HEADROOM (под верхним слоем реально можно
+    находиться — мост/этаж), иначе сливается в верхний.
+    """
     zs = sorted(set(zs), reverse=True)
     layers = []
     for z in zs:
         if not layers:
             layers.append(z)
-        elif layers[-1] - z > CLEARANCE:
+        elif layers[-1] - z > HEADROOM:
             layers.append(z)
-        # z ближе CLEARANCE к вышележащему слою: стоять нельзя — пропуск
+        # z ближе HEADROOM к вышележащему — стоять под верхним нельзя, слив
     return layers[:120]
 
 
@@ -410,7 +435,9 @@ def _edge_blocked(intervals, z):
     return False
 
 
-MIN_ISLAND = 64        # изолированные «острова» слоёв меньше этого — мусор
+MIN_ISLAND = 1200      # недостижимые с рельефа компоненты (крыши, навесы,
+                       # кроны) удаляются; сохраняются только огромные летающие
+                       # локации масштаба Superion (>1200 ячеек)
 
 
 def _prune_unreachable(cell_layers, hcell, hole_cell, max_step):
@@ -609,12 +636,34 @@ def generate_region_full(client_dir, region, max_step=UP_STEP, progress_cb=None,
     tris, skipped = region_mesh_triangles(unr, usx_dir, progress_cb)
     from .meshes import level_extra_triangles
     solid, blocking = level_extra_triangles(Package(unr))
-    tris.extend(solid)
     # конвенция высот едина для всего: меши и BSP сдвигаются так же, как рельеф
     zc = Z_CALIBRATION
     tris = [tuple((x, y, z + zc) for x, y, z in t) for t in tris]
+    solid = [tuple((x, y, z + zc) for x, y, z in t) for t in solid]
     blocking = [tuple((x, y, z + zc) for x, y, z in t) for t in blocking]
+    # 1) меши (+ BlockingVolume как стены) — основа полов/стен
     floors, walls, edges_x, edges_y = _rasterize(tris, west, north, blocking)
+    # 2) BSP-модель уровня даёт полы интерьеров, но и паразитные water/zone-
+    #    плоскости. Оставляем её слои ТОЛЬКО в футпринте мешей (интерьер
+    #    накрыт меш-стенами/крышей; открытая вода/зоны — без мешей) с
+    #    расширением на 1 ячейку под пороги/крыльцо.
+    footprint = _dilate_cells(set(floors) | set(walls))
+    sfloors, swalls, sedges_x, sedges_y = _rasterize(solid, west, north)
+    for cell, zs in sfloors.items():
+        if cell in footprint:
+            floors.setdefault(cell, []).extend(zs)
+    # стены и рёберные блокировки BSP-интерьеров — тоже только в футпринте
+    # (иначе вертикальные фрагменты water/zone дали бы ложные стены в поле);
+    # без этого сквозь чисто-BSP стены помещений можно было бы пройти
+    for cell, ivs in swalls.items():
+        if cell in footprint:
+            walls.setdefault(cell, []).extend(ivs)
+    for (gx, gy), ivs in sedges_x.items():
+        if gy * CELLS + gx in footprint:
+            edges_x.setdefault((gx, gy), []).extend(ivs)
+    for (gx, gy), ivs in sedges_y.items():
+        if gy * CELLS + gx in footprint:
+            edges_y.setdefault((gx, gy), []).extend(ivs)
     data = build_l2j_full(hcell, hole_cell, floors, walls, max_step,
                           edges_x, edges_y)
     return data, len(tris), skipped
