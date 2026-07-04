@@ -33,24 +33,101 @@ def ask(prompt, default=None):
     return os.path.expanduser(s) if s else default
 
 
-def _pick_regions(client_dir):
-    """Список квадратов клиента с мультивыбором.
-
-    Ввод: Enter — все; номера и диапазоны (1 4 7-12); имена (22_22);
-    можно вперемешку. Помечено ●c — есть Classic-вариант."""
+def _scan_regions(client_dir):
     import re as _re
     maps_dir = os.path.join(client_dir, 'Maps')
     if not os.path.isdir(maps_dir):
         maps_dir = os.path.join(client_dir, 'MAPS')
     if not os.path.isdir(maps_dir):
-        return None
+        return [], set()
     listing = os.listdir(maps_dir)
     mains = sorted(m.group(1) for f in listing
                    for m in [_re.match(r'^(\d+_\d+)\.unr$', f, _re.IGNORECASE)] if m)
     classics = {m.group(1) for f in listing
                 for m in [_re.match(r'^(\d+_\d+)_classic\.unr$', f, _re.IGNORECASE)] if m}
+    return mains, classics
+
+
+def _pick_regions_tui(mains, classics):
+    """Интерактивный выбор: стрелки — навигация, Enter/Space — выделить/снять,
+    A — все, N — ничего, G — генерировать, Q — отмена."""
+    import curses
+
+    COLS = 6
+
+    def run(scr):
+        curses.curs_set(0)
+        scr.keypad(True)
+        sel = set()
+        cur = 0
+        n = len(mains)
+        rows = (n + COLS - 1) // COLS
+        top = 0                                    # первая видимая строка сетки
+        while True:
+            scr.erase()
+            h, w = scr.getmaxyx()
+            vis_rows = max(3, h - 4)
+            crow, ccol = divmod(cur, COLS)
+            if crow < top:
+                top = crow
+            elif crow >= top + vis_rows:
+                top = crow - vis_rows + 1
+            scr.addnstr(0, 0, f'Квадраты клиента: {n} · выбрано: {len(sel)}'
+                        f'{" (Enter по G — все)" if not sel else ""}', w - 1,
+                        curses.A_BOLD)
+            for r in range(top, min(rows, top + vis_rows)):
+                y = 1 + r - top
+                for c in range(COLS):
+                    i = r * COLS + c
+                    if i >= n:
+                        break
+                    reg = mains[i]
+                    mark = 'c' if reg in classics else ' '
+                    box = '■' if i in sel else '·'
+                    attr = curses.A_REVERSE if i == cur else curses.A_NORMAL
+                    scr.addnstr(y, c * 13, f'{box} {reg}{mark}', 12, attr)
+            scr.addnstr(h - 2, 0, '─' * min(78, w - 1), w - 1)
+            scr.addnstr(h - 1, 0,
+                        '←↑↓→ навигация · Enter/Space — выделить/снять · '
+                        'A — все · N — ничего · G — генерировать · Q — отмена',
+                        w - 1, curses.A_DIM)
+            key = scr.getch()
+            if key in (curses.KEY_UP,) and cur >= COLS:
+                cur -= COLS
+            elif key == curses.KEY_DOWN and cur + COLS < n:
+                cur += COLS
+            elif key == curses.KEY_LEFT and cur > 0:
+                cur -= 1
+            elif key == curses.KEY_RIGHT and cur < n - 1:
+                cur += 1
+            elif key in (10, 13, curses.KEY_ENTER, ord(' ')):
+                sel.symmetric_difference_update({cur})
+            elif key in (ord('a'), ord('A'), ord('ф'), ord('Ф')):
+                sel = set(range(n))
+            elif key in (ord('n'), ord('N'), ord('т'), ord('Т')):
+                sel = set()
+            elif key in (ord('g'), ord('G'), ord('п'), ord('П')):
+                return sorted(mains[i] for i in sel) if sel else None
+            elif key in (ord('q'), ord('Q'), ord('й'), ord('Й')):
+                return 'CANCEL'
+    return curses.wrapper(run)
+
+
+def _pick_regions(client_dir):
+    """Выбор квадратов: TUI со стрелками; фолбэк — текстовый ввод
+    (номера/диапазоны/имена), если curses недоступен (Windows) или не TTY."""
+    import re as _re
+    mains, classics = _scan_regions(client_dir)
     if not mains:
         return None
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            import curses  # noqa: F401 — на Windows отсутствует
+            return _pick_regions_tui(mains, classics)
+        except ImportError:
+            pass
+        except Exception:
+            pass                                   # кривой TERM и т.п. — фолбэк
     print(f'\n  Квадраты клиента ({len(mains)}; ●c — есть Classic-вариант):')
     per_row = 6
     for i in range(0, len(mains), per_row):
@@ -141,6 +218,9 @@ def interactive():
             last_dir = c
             out = ask('Куда писать .l2j', os.path.join(c, 'generated_l2j'))
             regions = _pick_regions(c)
+            if regions == 'CANCEL':
+                print('  отменено.')
+                continue
             cmd_generate(c, out, regions)
         elif ch == '0' or ch == '':
             return 0
