@@ -84,16 +84,32 @@ def load_terrain(maps_dir, tex_dir, region, variant='main'):
     tm_ref = props.get('TerrainMap')
     tm_name = pkg.obj_name(tm_ref) if isinstance(tm_ref, int) else region
 
+    # utx-пакет, где реально лежит heightmap: карта указывает его в импорте
+    # TerrainMap (classic-зоны часто переиспользуют heightmap main/другого
+    # региона). Он идёт первым, затем — обычные кандидаты по имени региона.
     is_classic = '_classic' in os.path.basename(unr).lower()
-    utx_names = ([f'T_{region}_Classic.utx', f'T_{region}.utx'] if is_classic
-                 else [f'T_{region}.utx'])
-    utx = _find_file(tex_dir, utx_names)
-    if not utx:
-        raise GeoError(f'нет текстуры высот T_{region}.utx')
-    tpkg = Package(utx)
-    tex = [e for e in tpkg.find_exports('Texture') if e.name == tm_name]
+    imp_pkg = pkg.import_package(tm_ref)
+    utx_names = []
+    if imp_pkg:
+        utx_names.append(imp_pkg + '.utx')
+    utx_names += ([f'T_{region}_Classic.utx', f'T_{region}.utx'] if is_classic
+                  else [f'T_{region}.utx'])
+    # ищем первый utx, где есть нужная G16-текстура heightmap
+    tpkg = tex = None
+    for name in utx_names:
+        cand = _find_file(tex_dir, [name])
+        if not cand:
+            continue
+        cp = Package(cand)
+        hit = [e for e in cp.find_exports('Texture')
+               if e.name == tm_name
+               and read_properties(cp, e).get('Format') == 10]
+        if hit:
+            tpkg, tex = cp, hit
+            break
     if not tex:
-        raise GeoError(f'T_{region}.utx: нет текстуры {tm_name}')
+        raise GeoError(f'нет heightmap {tm_name} '
+                       f'(искал в {", ".join(utx_names)})')
     e = tex[0]
     tprops = read_properties(tpkg, e)
     usize, vsize = tprops.get('USize', HM), tprops.get('VSize', HM)
@@ -763,7 +779,22 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
           f' {green(f"✓ {ok}")}' + (f' · {red(f"✗ {len(errors)}")}' if errors else ''))
     for name, why in errors[:10]:
         print(f'    {red("✗")} {name}: {why}')
+    if errors:
+        print(dim('    (пропущены регионы без heightmap в клиенте — там нечего'
+                  ' генерировать; на классик-сервере такой квадрат берётся из main/)'))
     if not terrain_only:
-        print(f'\n  {yellow("Классик-сервер:")} основа — main/, поверх — файлы из classic/.')
-        print(f'  Проверка: geotool.py view … и geotool.py diff … с рабочей геодатой.')
+        main_dir = os.path.join(out_dir, 'main')
+        print(f'\n  {bold("Что дальше:")}')
+        print(f'    • {out_dir}/{bold("main")}/ — геодата всего мира. Для обычного'
+              ' (не classic) сервера бери её целиком.')
+        if classics:
+            print(f'    • {out_dir}/{bold("classic")}/ — {len(classics)} переработанных'
+                  ' для Classic зон. Для classic-сервера: возьми main/ и скопируй'
+                  ' classic/ поверх (замещает эти квадраты).')
+        print(f'\n  {yellow("Проверь перед установкой:")}')
+        print(f'    geotool.py view {main_dir}   — глянуть карту/города/слои в браузере')
+        print('    geotool.py diff <твоя_геодата> ' + main_dir
+              + '   — сравнить с текущей (высоты и проходимость)')
+        print(dim('    …и обязательно пройди ключевые зоны в игре — генерация'
+                  ' не проверяет их сама.'))
     return 0 if not errors else 2

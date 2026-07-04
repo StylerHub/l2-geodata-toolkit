@@ -157,6 +157,25 @@ class Package:
             return self.imports[-ref - 1][3]
         return None
 
+    def import_package(self, ref):
+        """Имя верхнего Package в цепочке импорта объектной ссылки (или None).
+        Для heightmap-текстуры даёт utx-пакет, где реально лежат данные —
+        карта может ссылаться на heightmap другого/main-региона."""
+        if not isinstance(ref, int) or ref >= 0:
+            return None
+        idx = -ref - 1
+        last_pkg = None
+        seen = 0
+        while 0 <= idx < len(self.imports) and seen < 64:
+            _cpkg, cname, pref, nm = self.imports[idx]
+            if cname == 'Package':
+                last_pkg = nm                     # верхний файл-пакет (последний в цепочке)
+            if pref >= 0:
+                break
+            idx = -pref - 1
+            seen += 1
+        return last_pkg
+
     def class_name(self, e):
         return self.obj_name(e.cls) or 'Class'
 
