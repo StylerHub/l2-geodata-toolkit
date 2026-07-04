@@ -119,7 +119,12 @@ def transform(verts, mtx, loc):
 
 
 class MeshLibrary:
-    """Кэш распарсенных мешей по (пакет, имя)."""
+    """Кэш распарсенных мешей по (пакет, имя).
+
+    Сырые USX-пакеты (весь файл в памяти) ограничены LRU-лимитом —
+    иначе городской регион раздувает каждый воркер на гигабайты."""
+
+    MAX_PACKAGES = 6
 
     def __init__(self, usx_dir):
         self.usx_dir = usx_dir
@@ -145,6 +150,8 @@ class MeshLibrary:
                         raise GeoError(f'нет пакета {pkg_name}.usx')
                     path = os.path.join(self.usx_dir, cand[0])
                 pkg = Package(path)
+                while len(self.packages) >= self.MAX_PACKAGES:
+                    self.packages.pop(next(iter(self.packages)))
                 self.packages[pkg_name.lower()] = pkg
             ex = [x for x in pkg.find_exports('StaticMesh') if x.name == mesh_name]
             if not ex:
