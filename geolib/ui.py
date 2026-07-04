@@ -44,12 +44,45 @@ BANNER = '''
 '''
 
 
-def progress(done, total, prefix=''):
+def fmt_dur(sec):
+    """Секунды → компактная длительность (2м 05с / 1ч 12м)."""
+    sec = int(max(0, sec))
+    if sec < 60:
+        return f'{sec}с'
+    if sec < 3600:
+        return f'{sec // 60}м {sec % 60:02d}с'
+    return f'{sec // 3600}ч {(sec % 3600) // 60:02d}м'
+
+
+def progress(done, total, prefix='', suffix=''):
+    """Прогресс-бар с авто-оценкой остатка времени (ETA).
+
+    Время старта засекается на первом тике (по ключу prefix); ETA =
+    среднее-на-единицу × остаток. suffix, если задан, вытесняет ETA."""
+    import time
+    key = prefix or '_'
+    starts = progress._starts
+    if done <= 1:                                # начало цикла — новый отсчёт
+        starts[key] = time.monotonic()
+    elif key not in starts:
+        starts[key] = time.monotonic()
     w = 36
     frac = done / total if total else 1.0
     bar = '█' * int(w * frac) + '░' * (w - int(w * frac))
-    sys.stdout.write(f'\r  {prefix}{cyan(bar)} {frac:6.1%} ({done}/{total})')
+    if suffix:
+        tail = '  ' + suffix
+    elif 1 <= done < total:
+        elapsed = time.monotonic() - starts[key]
+        tail = '  ~' + fmt_dur(elapsed / done * (total - done)) if elapsed > 0.3 else ''
+    else:
+        tail = ''
+    line = f'\r  {prefix}{cyan(bar)} {frac:6.1%} ({done}/{total}){tail}'
+    sys.stdout.write(line + ' ' * 12)            # затираем хвост прошлой строки (ETA до ~9 колонок)
     sys.stdout.flush()
     if done == total:
+        starts.pop(key, None)
         sys.stdout.write('\n')
+
+
+progress._starts = {}
 

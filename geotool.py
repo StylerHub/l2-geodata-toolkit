@@ -75,6 +75,8 @@ def _pick_regions_tui(mains, classics):
             scr.addnstr(0, 0, f'Квадраты клиента: {n} · выбрано: {len(sel)}'
                         f'{" (Enter по G — все)" if not sel else ""}', w - 1,
                         curses.A_BOLD)
+            if w < COLS * 13 + 1 or h < 6:        # окно не вмещает сетку → текст. фолбэк
+                return 'SMALL'
             for r in range(top, min(rows, top + vis_rows)):
                 y = 1 + r - top
                 for c in range(COLS):
@@ -85,7 +87,7 @@ def _pick_regions_tui(mains, classics):
                     mark = 'c' if reg in classics else ' '
                     box = '■' if i in sel else '·'
                     attr = curses.A_REVERSE if i == cur else curses.A_NORMAL
-                    scr.addnstr(y, c * 13, f'{box} {reg}{mark}', 12, attr)
+                    scr.addnstr(y, c * 13, f'{box} {reg}{mark}', min(12, w - 1 - c * 13), attr)
             scr.addnstr(h - 2, 0, '─' * min(78, w - 1), w - 1)
             scr.addnstr(h - 1, 0,
                         '←↑↓→ навигация · Enter/Space — выделить/снять · '
@@ -108,7 +110,7 @@ def _pick_regions_tui(mains, classics):
                 sel = set()
             elif key in (ord('g'), ord('G'), ord('п'), ord('П')):
                 return sorted(mains[i] for i in sel) if sel else None
-            elif key in (ord('q'), ord('Q'), ord('й'), ord('Й')):
+            elif key in (27, ord('q'), ord('Q'), ord('й'), ord('Й')):
                 return 'CANCEL'
     return curses.wrapper(run)
 
@@ -123,7 +125,9 @@ def _pick_regions(client_dir):
     if sys.stdin.isatty() and sys.stdout.isatty():
         try:
             import curses  # noqa: F401 — на Windows отсутствует
-            return _pick_regions_tui(mains, classics)
+            res = _pick_regions_tui(mains, classics)
+            if res != 'SMALL':                     # SMALL — окно мало, ниже текст. ввод
+                return res
         except ImportError:
             pass
         except Exception:
@@ -154,9 +158,13 @@ def _pick_regions(client_dir):
         else:
             print(f'  ⚠ не понял «{tok}» — пропускаю')
     chosen = sorted(set(chosen))
+    if not chosen:
+        # ввод был, но ничего не распознано — не запускаем «все» по ошибке
+        print('  ⚠ ничего не распознано — отмена (Enter без ввода = все).')
+        return 'CANCEL'
     print(f'  выбрано: {len(chosen)} — {" ".join(chosen[:12])}' +
           (' …' if len(chosen) > 12 else ''))
-    return chosen or None
+    return chosen
 
 
 def interactive():

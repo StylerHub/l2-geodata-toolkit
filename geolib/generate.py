@@ -607,23 +607,75 @@ def generate_region_full(client_dir, region, max_step=UP_STEP, progress_cb=None,
 # ─────────────────────────── команда generate ───────────────────────────
 
 def _worker(job):
-    """Один регион одного варианта (для пула процессов)."""
+    """Один регион одного варианта (для пула процессов).
+
+    Атомарная запись: сперва во временный файл, валидация, затем
+    os.replace → каноничный .l2j появляется только целым и проверенным.
+    Прерывание (Ctrl+C/terminate) в момент записи оставит максимум .tmp,
+    но никогда — обрезанный или невалидный .l2j.
+    """
     client_dir, region, variant, out_path, max_step, terrain_only = job
+    tmp = out_path + '.tmp'
     try:
         if terrain_only:
             data = generate_region(client_dir, region, max_step, variant)
         else:
             data, _n, _s = generate_region_full(client_dir, region, max_step,
                                                 variant=variant)
-        open(out_path, 'wb').write(data)
+        with open(tmp, 'wb') as f:
+            f.write(data)
         from .convert import validate_l2j
-        validate_l2j(out_path)
+        validate_l2j(tmp)
+        os.replace(tmp, out_path)                 # атомарная подмена
         return (region, variant, None)
-    except Exception as e:                        # noqa: BLE001 — воркер не должен падать молча
-        if os.path.exists(out_path):
-            os.remove(out_path)
+    except BaseException as e:                     # incl. KeyboardInterrupt/SystemExit
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
         return (region, variant, f'{type(e).__name__}: {e}')
 
+
+
+WORKER_RAM_GB = 2.5    # оценка пиковой памяти воркера на городском регионе
+
+
+def _total_ram_gb():
+    """Всего ОЗУ (ГБ), кроссплатформенно, без зависимостей. None если не узнать."""
+    try:
+        return os.sysconf('SC_PHYS_PAGES') * os.sysconf('SC_PAGE_SIZE') / 1e9
+    except (ValueError, AttributeError, OSError):
+        pass
+    try:
+        import ctypes                                       # Windows
+        class MS(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong),
+                        ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong),
+                        ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong),
+                        ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong),
+                        ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+        ms = MS()
+        ms.dwLength = ctypes.sizeof(MS)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+        return ms.ullTotalPhys / 1e9
+    except Exception:
+        return None
+
+
+def _auto_jobs():
+    """Авто-параллелизм ≈ половина ресурсов: половина ядер, но не больше,
+    чем влезает в половину ОЗУ (по WORKER_RAM_GB на воркер)."""
+    cores = os.cpu_count() or 4
+    half_cores = max(1, cores // 2)
+    total = _total_ram_gb()
+    if total:
+        mem_jobs = max(1, int(total * 0.5 / WORKER_RAM_GB))
+        return min(half_cores, mem_jobs)
+    return half_cores
 
 
 def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
@@ -637,7 +689,7 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
     import multiprocessing as mp
     import re as _re
     import time as _t
-    from .ui import bold, green, progress, red, yellow
+    from .ui import bold, dim, green, progress, red, yellow
     maps_dir = os.path.join(client_dir, 'Maps')
     if not os.path.isdir(maps_dir):
         maps_dir = os.path.join(client_dir, 'MAPS')
@@ -662,20 +714,51 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
     os.makedirs(os.path.join(out_dir, 'main'), exist_ok=True)
     if classics:
         os.makedirs(os.path.join(out_dir, 'classic'), exist_ok=True)
-    nproc = jobs or max(1, (os.cpu_count() or 4) - 1)
+    nproc = jobs or _auto_jobs()
+    ram = _total_ram_gb()
+    how = 'задано -j' if jobs else (f'авто: половина ресурсов'
+          + (f' от {ram:.0f} ГБ ОЗУ / {os.cpu_count() or "?"} потоков' if ram else ''))
     print(f'  {bold("Генерация")}: main {len(mains)} + classic {len(classics)}'
-          f' → {out_dir} · {nproc} процессов'
+          f' → {out_dir} · {nproc} процессов ({how})'
           f'{" · только рельеф" if terrain_only else ""}\n')
+    print(dim('  (Ctrl+C — прервать; готовые файлы сохранятся)\n'))
     t0 = _t.time()
-    ok, errors = 0, []
-    with mp.Pool(nproc) as pool:
+    ok, errors, done = 0, [], 0
+    total = len(tasks)
+    aborted = False
+    # воркеры игнорируют SIGINT — прерывание ловит только главный процесс,
+    # чтобы Ctrl+C не сыпал трейсбеками из пула
+    import signal
+    orig = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    pool = mp.Pool(nproc)
+    signal.signal(signal.SIGINT, orig)
+    try:
         for i, (region, variant, err) in enumerate(
                 pool.imap_unordered(_worker, tasks), 1):
+            done = i
             if err is None:
                 ok += 1
             else:
                 errors.append((f'{region}/{variant}', err))
-            progress(i, len(tasks), 'генерация ')
+            progress(i, total, 'генерация ')
+    except KeyboardInterrupt:
+        aborted = True
+        pool.terminate()
+        print(dim(f'\n  прервано на {done}/{total} — готовые {ok} файлов сохранены.'))
+    else:
+        pool.close()
+    finally:
+        pool.join()
+        # подчистить .tmp-огрызки прерванных записей (SIGTERM мог убить до уборки)
+        import glob as _g2
+        for sub in ('main', 'classic'):
+            for t in _g2.glob(os.path.join(out_dir, sub, '*.l2j.tmp')):
+                try:
+                    os.remove(t)
+                except OSError:
+                    pass
+    if aborted:
+        return 130
     print(f'\n  {bold("Итог")} за {(_t.time() - t0) / 60:.1f} мин:'
           f' {green(f"✓ {ok}")}' + (f' · {red(f"✗ {len(errors)}")}' if errors else ''))
     for name, why in errors[:10]:

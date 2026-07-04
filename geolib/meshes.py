@@ -127,8 +127,9 @@ class MeshLibrary:
     MAX_PACKAGES = 6
 
     def __init__(self, usx_dir):
+        import collections
         self.usx_dir = usx_dir
-        self.packages = {}
+        self.packages = collections.OrderedDict()  # LRU: недавние в конце
         self.meshes = {}
         self.failed = {}
 
@@ -139,7 +140,10 @@ class MeshLibrary:
         if key in self.failed:
             return None
         try:
-            pkg = self.packages.get(pkg_name.lower())
+            low = pkg_name.lower()
+            pkg = self.packages.get(low)
+            if pkg is not None:
+                self.packages.move_to_end(low)     # освежить recency
             if pkg is None:
                 path = os.path.join(self.usx_dir, pkg_name + '.usx')
                 if not os.path.exists(path):
@@ -151,8 +155,8 @@ class MeshLibrary:
                     path = os.path.join(self.usx_dir, cand[0])
                 pkg = Package(path)
                 while len(self.packages) >= self.MAX_PACKAGES:
-                    self.packages.pop(next(iter(self.packages)))
-                self.packages[pkg_name.lower()] = pkg
+                    self.packages.popitem(last=False)  # выселить самый старый
+                self.packages[low] = pkg
             ex = [x for x in pkg.find_exports('StaticMesh') if x.name == mesh_name]
             if not ex:
                 raise GeoError(f'{pkg_name}.usx: нет меша {mesh_name}')
