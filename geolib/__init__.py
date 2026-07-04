@@ -5,4 +5,5 @@
 from .checks import cmd_check, cmd_verify
 from .convert import cmd_convert, cmd_l2j2pts
 from .diff import cmd_diff
+from .generate import cmd_generate
 from .viewer import cmd_view

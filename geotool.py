@@ -10,6 +10,7 @@
   convert <dir|files...> -o <dir> [-y]         конвертер PTS → L2J
   view   <dir> [--port N]                      браузерный просмотрщик
   diff   <dirA> <dirB> [--region XX_YY]        сравнение двух наборов
+  generate <клиент> -o <dir> [--region ...]    генерация из файлов клиента
   check  <dir|files...>                        валидация + заглушки
   verify <dir1> <dir2>                         сверка PTS ↔ L2J (порядок любой)
   l2j2pts <file|dir> -o <dir>                  обратный конвертер L2J → PTS
@@ -23,7 +24,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from geolib import cmd_check, cmd_convert, cmd_diff, cmd_l2j2pts, cmd_verify, cmd_view
+from geolib import cmd_check, cmd_convert, cmd_diff, cmd_generate, cmd_l2j2pts, cmd_verify, cmd_view
 from geolib.ui import BANNER, bold, cyan, dim
 
 
@@ -44,6 +45,7 @@ def interactive():
   {bold('4')}  Проверка набора (валидация, поиск заглушек)
   {bold('5')}  Сверка конвертации PTS ↔ L2J (в обе стороны, поячеечно)
   {bold('6')}  Обратный конвертер L2J → PTS (для G3DEditor и др.)
+  {bold('7')}  Генерация геодаты из клиента (Maps + Textures + StaticMeshes)
   {bold('0')}  Выход
 ''')
         ch = input('  выбор: ').strip()
@@ -83,6 +85,14 @@ def interactive():
             if src:
                 last_dir = src
                 cmd_l2j2pts([src], out)
+        elif ch == '7':
+            c = ask('Папка клиента L2 (с Maps/Textures/StaticMeshes)', last_dir)
+            if not c:
+                continue
+            last_dir = c
+            out = ask('Куда писать .l2j', os.path.join(c, 'generated_l2j'))
+            r = ask('Регионы через пробел (Enter — все)', None)
+            cmd_generate(c, out, r.split() if r else None)
         elif ch == '0' or ch == '':
             return 0
       except EOFError:
@@ -97,6 +107,7 @@ def main():
     p = sub.add_parser('convert'); p.add_argument('src', nargs='+'); p.add_argument('-o', '--out', required=True); p.add_argument('-y', '--yes', action='store_true')
     p = sub.add_parser('view'); p.add_argument('dir'); p.add_argument('--port', type=int, default=8777)
     p = sub.add_parser('diff'); p.add_argument('dir_a'); p.add_argument('dir_b'); p.add_argument('--region')
+    p = sub.add_parser('generate'); p.add_argument('client'); p.add_argument('-o', '--out', required=True); p.add_argument('--region', nargs='*'); p.add_argument('--terrain-only', action='store_true'); p.add_argument('--max-step', type=int, default=16); p.add_argument('-j', '--jobs', type=int)
     p = sub.add_parser('check'); p.add_argument('paths', nargs='+')
     p = sub.add_parser('verify'); p.add_argument('pts_dir'); p.add_argument('l2j_dir')
     p = sub.add_parser('l2j2pts'); p.add_argument('src', nargs='+'); p.add_argument('-o', '--out', required=True); p.add_argument('-y', '--yes', action='store_true')
@@ -111,6 +122,9 @@ def main():
         return cmd_view(x(args.dir), args.port)
     if args.cmd == 'diff':
         return cmd_diff(x(args.dir_a), x(args.dir_b), args.region)
+    if args.cmd == 'generate':
+        return cmd_generate(x(args.client), x(args.out), args.region,
+                            args.max_step, args.terrain_only, args.jobs)
     if args.cmd == 'check':
         return cmd_check([x(pp) for pp in args.paths])
     if args.cmd == 'verify':

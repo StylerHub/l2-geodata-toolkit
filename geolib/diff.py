@@ -127,6 +127,29 @@ def _detail(region, fa, fb, name_a, name_b):
           f' · в пределах ±{NEAR}: {n_near / n_cells:.1%}'.replace(',', ' '))
     print(f'  блоков с |Δh| > {FAR}: {n_far_blocks} ({n_far_blocks / 655.36:.1f}%)')
 
+    # NSWE: проходимость на сопоставимых поверхностях (|Δh| ≤ NEAR)
+    nswe_n = nswe_same = 0
+    dir_diff = [0, 0, 0, 0]                       # N, S, W, E
+    for i in range(BLOCKS):
+        for ca, cb in zip(a[i], b[i]):
+            la = max(ca, key=lambda l: l[0])
+            lb = max(cb, key=lambda l: l[0])
+            if abs(la[0] - lb[0]) > NEAR:
+                continue
+            nswe_n += 1
+            if la[1] == lb[1]:
+                nswe_same += 1
+            else:
+                x = la[1] ^ lb[1]
+                for bi_, bit in enumerate((8, 4, 2, 1)):
+                    if x & bit:
+                        dir_diff[bi_] += 1
+    if nswe_n:
+        print(f'  NSWE (на сопоставимых поверхностях): совпадение '
+              f'{nswe_same / nswe_n:.1%} из {nswe_n:,} ячеек'.replace(',', ' '))
+        print(f'    расхождения по направлениям: N {dir_diff[0]:,} · S {dir_diff[1]:,}'
+              f' · W {dir_diff[2]:,} · E {dir_diff[3]:,}'.replace(',', ' '))
+
     # кластеры: суперблоки 16×16 с наибольшим числом расходящихся блоков
     sup = {}
     for bx in range(256):
