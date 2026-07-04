@@ -33,6 +33,55 @@ def ask(prompt, default=None):
     return os.path.expanduser(s) if s else default
 
 
+def _pick_regions(client_dir):
+    """Список квадратов клиента с мультивыбором.
+
+    Ввод: Enter — все; номера и диапазоны (1 4 7-12); имена (22_22);
+    можно вперемешку. Помечено ●c — есть Classic-вариант."""
+    import re as _re
+    maps_dir = os.path.join(client_dir, 'Maps')
+    if not os.path.isdir(maps_dir):
+        maps_dir = os.path.join(client_dir, 'MAPS')
+    if not os.path.isdir(maps_dir):
+        return None
+    listing = os.listdir(maps_dir)
+    mains = sorted(m.group(1) for f in listing
+                   for m in [_re.match(r'^(\d+_\d+)\.unr$', f, _re.IGNORECASE)] if m)
+    classics = {m.group(1) for f in listing
+                for m in [_re.match(r'^(\d+_\d+)_classic\.unr$', f, _re.IGNORECASE)] if m}
+    if not mains:
+        return None
+    print(f'\n  Квадраты клиента ({len(mains)}; ●c — есть Classic-вариант):')
+    per_row = 6
+    for i in range(0, len(mains), per_row):
+        row = ''
+        for j, r in enumerate(mains[i:i + per_row], i + 1):
+            mark = '●c' if r in classics else '  '
+            row += f'{j:4d}) {r}{mark} '
+        print('  ' + row)
+    raw = input('\n  Выбор (Enter — все, номера/диапазоны/имена): ').strip()
+    if not raw:
+        return None
+    chosen = []
+    for tok in raw.replace(',', ' ').split():
+        m = _re.match(r'^(\d+)-(\d+)$', tok)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            for k in range(min(a, b), max(a, b) + 1):
+                if 1 <= k <= len(mains):
+                    chosen.append(mains[k - 1])
+        elif _re.match(r'^\d+_\d+$', tok):
+            chosen.append(tok)
+        elif tok.isdigit() and 1 <= int(tok) <= len(mains):
+            chosen.append(mains[int(tok) - 1])
+        else:
+            print(f'  ⚠ не понял «{tok}» — пропускаю')
+    chosen = sorted(set(chosen))
+    print(f'  выбрано: {len(chosen)} — {" ".join(chosen[:12])}' +
+          (' …' if len(chosen) > 12 else ''))
+    return chosen or None
+
+
 def interactive():
     print(cyan(BANNER))
     last_dir = None  # последний использованный путь — подсказка для следующих промптов
@@ -91,8 +140,8 @@ def interactive():
                 continue
             last_dir = c
             out = ask('Куда писать .l2j', os.path.join(c, 'generated_l2j'))
-            r = ask('Регионы через пробел (Enter — все)', None)
-            cmd_generate(c, out, r.split() if r else None)
+            regions = _pick_regions(c)
+            cmd_generate(c, out, regions)
         elif ch == '0' or ch == '':
             return 0
       except EOFError:
