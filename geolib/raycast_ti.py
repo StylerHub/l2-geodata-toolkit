@@ -163,13 +163,16 @@ def zray_columns(fc, fc_grid, west, north, cells_order, walk_nz):
 
 
 def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
-              up_step, down_step, body_lo, body_hi):
+              up_step, down_step, ray_offs, lat_offs, blk_lo, blk_hi):
     """NSWE всех слоёв всего грида на устройстве (горячий цикл сборки). Для каждой
     ячейки 2048² и каждого её слоя z считает 4 бита проходимости N,S,W,E по той же
     логике, что и Python build_l2j_ray: перепад высот к слоям соседа (_step_ok),
-    заградительные рёбра (blocked) и стена корпуса (X/Y-луч seg_hit по граням
-    ячейки И соседа, AND низ+верх), плюс anti-глухая. Стена считается для ЛЮБОЙ
-    ячейки со стенами-гранями рядом (включая терраиновые без floor-слоёв).
+    заградительные рёбра blocked (dict ключ → (zlo, zhi), заграждают только слой,
+    чьё окно корпуса blk_lo..blk_hi пересекает их z-диапазон) и стена корпуса —
+    X/Y-лучи seg_hit по граням ячейки И соседа: высоты ray_offs над полом ×
+    боковые смещения lat_offs, ЛЮБОЕ попадание = стена (окно груди).
+    Плюс anti-глухая. Стена считается для ЛЮБОЙ ячейки со стенами-гранями рядом
+    (включая терраиновые без floor-слоёв).
 
     Возвращает (nswe_flat, l_off): nswe_flat[l_off[cell]+j] — nswe j-го слоя.
     Слои раскладываются в CSR; большинство ячеек — 1 слой рельефа, мультислои
@@ -209,13 +212,19 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
     walls_arr = np.asarray(walls, dtype=np.float64) if walls else \
         np.zeros((1, 9), dtype=np.float64)
 
-    # ── заградительные рёбра в два грид-массива ──
-    blk_y = np.zeros(N, dtype=np.int8)   # ('y', gx, gy): граница N ячейки (gx,gy)
-    blk_x = np.zeros(N, dtype=np.int8)   # ('x', gx, gy): граница W ячейки (gx,gy)
-    for key in blocked:
-        kind, gx, gy = key
+    # ── заградительные рёбра в грид-массивы z-диапазонов ──
+    # сентинел (lo=+1e30 > hi=-1e30) — границы без объёма: окно не пересекается
+    blk_y_lo = np.full(N, 1e30)          # ('y', gx, gy): граница N ячейки (gx,gy)
+    blk_y_hi = np.full(N, -1e30)
+    blk_x_lo = np.full(N, 1e30)          # ('x', gx, gy): граница W ячейки (gx,gy)
+    blk_x_hi = np.full(N, -1e30)
+    for (kind, gx, gy), (zlo, zhi) in blocked.items():
         if 0 <= gx < C and 0 <= gy < C:
-            (blk_y if kind == 'y' else blk_x)[gy * C + gx] = 1
+            i = gy * C + gx
+            if kind == 'y':
+                blk_y_lo[i], blk_y_hi[i] = zlo, zhi
+            else:
+                blk_x_lo[i], blk_x_hi[i] = zlo, zhi
 
     l_off32 = l_off.astype(np.int32)
     f_off = ti.ndarray(ti.i32, shape=(N + 1,))
@@ -223,16 +232,20 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
     f_woff = ti.ndarray(ti.i32, shape=(N + 1,))
     f_wflat = ti.ndarray(ti.i32, shape=(max(w_total, 1),))
     f_walls = ti.ndarray(ti.f64, shape=walls_arr.shape)
-    f_by = ti.ndarray(ti.i32, shape=(N,))
-    f_bx = ti.ndarray(ti.i32, shape=(N,))
+    f_bylo = ti.ndarray(ti.f64, shape=(N,))
+    f_byhi = ti.ndarray(ti.f64, shape=(N,))
+    f_bxlo = ti.ndarray(ti.f64, shape=(N,))
+    f_bxhi = ti.ndarray(ti.f64, shape=(N,))
     o_nswe = ti.ndarray(ti.i32, shape=(max(total, 1),))
     f_off.from_numpy(l_off32)
     f_z.from_numpy(l_z if total else np.zeros(1, np.float64))
     f_woff.from_numpy(w_off.astype(np.int32))
     f_wflat.from_numpy(w_flat)
     f_walls.from_numpy(walls_arr)
-    f_by.from_numpy(blk_y.astype(np.int32))
-    f_bx.from_numpy(blk_x.astype(np.int32))
+    f_bylo.from_numpy(blk_y_lo)
+    f_byhi.from_numpy(blk_y_hi)
+    f_bxlo.from_numpy(blk_x_lo)
+    f_bxhi.from_numpy(blk_x_hi)
 
     @ti.func
     def seg_hit(px, py, pz, npx, npy, ax, ay, az,
@@ -261,11 +274,29 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
                         res = 1
         return res
 
+    @ti.func
+    def wall_any(px, py, z, npx, npy, lx, ly,
+                 ax, ay, az, e1x, e1y, e1z, e2x, e2y, e2z) -> ti.i32:
+        # окно груди: лучи ray_offs над полом × параллельные линии
+        # lat_offs поперёк движения; ЛЮБОЕ попадание = стена (== Python
+        # _wall_between, порядок неважен — any-hit)
+        res = 0
+        for li in ti.static(range(len(lat_offs))):
+            for ri in ti.static(range(len(ray_offs))):
+                if res == 0:
+                    if seg_hit(px + lx * lat_offs[li], py + ly * lat_offs[li],
+                               z + ray_offs[ri],
+                               npx + lx * lat_offs[li], npy + ly * lat_offs[li],
+                               ax, ay, az, e1x, e1y, e1z, e2x, e2y, e2z) == 1:
+                        res = 1
+        return res
+
     @ti.kernel
     def nk(f_off: ti.types.ndarray(), f_z: ti.types.ndarray(),
            f_woff: ti.types.ndarray(), f_wflat: ti.types.ndarray(),
-           f_walls: ti.types.ndarray(), f_by: ti.types.ndarray(),
-           f_bx: ti.types.ndarray(), o_nswe: ti.types.ndarray(),
+           f_walls: ti.types.ndarray(), f_bylo: ti.types.ndarray(),
+           f_byhi: ti.types.ndarray(), f_bxlo: ti.types.ndarray(),
+           f_bxhi: ti.types.ndarray(), o_nswe: ti.types.ndarray(),
            west: ti.f64, north: ti.f64, up: ti.f64, down: ti.f64,
            blo: ti.f64, bhi: ti.f64):
         for cell in range(N):
@@ -290,58 +321,54 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
                             dz = f_z[kk] - z
                             if dz >= -down and dz <= up:
                                 hok = 1
-                        # заградительное ребро направления d
-                        blk = 0
+                        # заградительное ребро направления d: z-диапазон объёма
+                        blk_zlo = 1e30
+                        blk_zhi = -1e30
                         if ti.static(d == 0):
-                            blk = f_by[cell]
+                            blk_zlo = f_bylo[cell]
+                            blk_zhi = f_byhi[cell]
                         elif ti.static(d == 1):
-                            blk = f_by[ncell]
+                            blk_zlo = f_bylo[ncell]
+                            blk_zhi = f_byhi[ncell]
                         elif ti.static(d == 2):
-                            blk = f_bx[cell]
+                            blk_zlo = f_bxlo[cell]
+                            blk_zhi = f_bxhi[cell]
                         else:
-                            blk = f_bx[ncell]
-                        if blk == 1:
+                            blk_zlo = f_bxlo[ncell]
+                            blk_zhi = f_bxhi[ncell]
+                        # заграждает, только если диапазон пересекает окно
+                        # корпуса слоя (объём на мосту не запирает пол под ним)
+                        if blk_zlo < z + bhi and blk_zhi > z + blo:
                             nswe &= ~bit
                             if hok == 1:
                                 block_bits |= bit
                         elif hok == 0:
                             nswe &= ~bit
                         else:
-                            # X/Y-луч стены: AND низ(blo)+верх(bhi) по граням
-                            # своей ячейки И соседа (seg_hit по обеим)
+                            # X/Y-лучи стены (окно груди, any-hit) по граням
+                            # своей ячейки И соседа
                             npx = west + ngx * 16 + 8
                             npy = north + ngy * 16 + 8
-                            h_lo = 0
-                            h_hi = 0
+                            lxs = 1.0 if d < 2 else 0.0    # поперёк движения
+                            lys = 0.0 if d < 2 else 1.0
+                            hitw = 0
                             for kk in range(f_woff[cell], f_woff[cell + 1]):
-                                wi = f_wflat[kk]
-                                if h_lo == 0 and seg_hit(
-                                        px, py, z + blo, npx, npy,
+                                if hitw == 0:
+                                    wi = f_wflat[kk]
+                                    hitw = wall_any(
+                                        px, py, z, npx, npy, lxs, lys,
                                         f_walls[wi, 0], f_walls[wi, 1], f_walls[wi, 2],
                                         f_walls[wi, 3], f_walls[wi, 4], f_walls[wi, 5],
-                                        f_walls[wi, 6], f_walls[wi, 7], f_walls[wi, 8]) == 1:
-                                    h_lo = 1
-                                if h_hi == 0 and seg_hit(
-                                        px, py, z + bhi, npx, npy,
-                                        f_walls[wi, 0], f_walls[wi, 1], f_walls[wi, 2],
-                                        f_walls[wi, 3], f_walls[wi, 4], f_walls[wi, 5],
-                                        f_walls[wi, 6], f_walls[wi, 7], f_walls[wi, 8]) == 1:
-                                    h_hi = 1
+                                        f_walls[wi, 6], f_walls[wi, 7], f_walls[wi, 8])
                             for kk in range(f_woff[ncell], f_woff[ncell + 1]):
-                                wi = f_wflat[kk]
-                                if h_lo == 0 and seg_hit(
-                                        px, py, z + blo, npx, npy,
+                                if hitw == 0:
+                                    wi = f_wflat[kk]
+                                    hitw = wall_any(
+                                        px, py, z, npx, npy, lxs, lys,
                                         f_walls[wi, 0], f_walls[wi, 1], f_walls[wi, 2],
                                         f_walls[wi, 3], f_walls[wi, 4], f_walls[wi, 5],
-                                        f_walls[wi, 6], f_walls[wi, 7], f_walls[wi, 8]) == 1:
-                                    h_lo = 1
-                                if h_hi == 0 and seg_hit(
-                                        px, py, z + bhi, npx, npy,
-                                        f_walls[wi, 0], f_walls[wi, 1], f_walls[wi, 2],
-                                        f_walls[wi, 3], f_walls[wi, 4], f_walls[wi, 5],
-                                        f_walls[wi, 6], f_walls[wi, 7], f_walls[wi, 8]) == 1:
-                                    h_hi = 1
-                            if h_lo == 1 and h_hi == 1:
+                                        f_walls[wi, 6], f_walls[wi, 7], f_walls[wi, 8])
+                            if hitw == 1:
                                 nswe &= ~bit
                                 wall_bits |= bit
                 # anti-глухая: возвращаем сторону обхода, но сквозную преграду
@@ -355,9 +382,9 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
                     nswe = give
                 o_nswe[k] = nswe
 
-    nk(f_off, f_z, f_woff, f_wflat, f_walls, f_by, f_bx, o_nswe,
-       float(west), float(north), float(up_step), float(down_step),
-       float(body_lo), float(body_hi))
+    nk(f_off, f_z, f_woff, f_wflat, f_walls, f_bylo, f_byhi, f_bxlo, f_bxhi,
+       o_nswe, float(west), float(north), float(up_step), float(down_step),
+       float(blk_lo), float(blk_hi))
     ti.sync()
     nswe_np = o_nswe.to_numpy()
     # nswe_np[l_off[cell]+j] = nswe j-го слоя ячейки cell (рельеф = слой 0).
