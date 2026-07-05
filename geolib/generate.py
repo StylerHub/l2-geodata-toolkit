@@ -515,10 +515,15 @@ def _blocking_edges(blocking, west, north):
     """BlockingVolume-грани → множество закрытых границ ячеек (заградительные
     стены уровня: край играбельной зоны, перекрытые дороги). Возвращает set
     ключей: ('x', gx, gy) — граница между (gx-1,gy) и (gx,gy); ('y', gx, gy) —
-    между (gx,gy-1) и (gx,gy). В отличие от стен мешей, BlockingVolume мало
-    (десятки-сотни граней), лавины ложных блокировок не даёт."""
+    между (gx,gy-1) и (gx,gy). Крупные грани (>BIG_PLANE) — заградительный объём
+    ВОКРУГ зоны/локации, а не внутренняя стена: их растеризация заперла бы всю
+    зону изнутри (лавина глухих), поэтому пропускаем."""
     blocked = set()
     for tri in blocking:
+        xs = (tri[0][0], tri[1][0], tri[2][0])
+        ys = (tri[0][1], tri[1][1], tri[2][1])
+        if max(xs) - min(xs) > BIG_PLANE or max(ys) - min(ys) > BIG_PLANE:
+            continue                               # граница локации, не стена
         for (x0, y0, _z0), (x1, y1, _z1) in ((tri[0], tri[1]), (tri[1], tri[2]),
                                              (tri[2], tri[0])):
             dx, dy = x1 - x0, y1 - y0
@@ -599,11 +604,14 @@ def build_l2j_full(hcell, hole_cell, floors, ceils, max_step=UP_STEP, blocked=()
                                 (1, gx + 1, gy, ('x', gx + 1, gy), (gx + 1, gy), edges_x)):
                             if not (0 <= ngx < CELLS and 0 <= ngy < CELLS):
                                 continue
+                            nls = layers_at(ngx, ngy)
+                            height_ok = any(_step_ok(nz - z, max_step) for nz in nls)
                             if bkey in blocked:                # BlockingVolume
                                 nswe &= ~bit
+                                if height_ok:                  # ровно — снимаемо anti-глухой
+                                    wall_bits |= bit
                                 continue
-                            nls = layers_at(ngx, ngy)
-                            if not any(_step_ok(nz - z, max_step) for nz in nls):
+                            if not height_ok:
                                 nswe &= ~bit                   # перепад высот (склон/обрыв)
                                 continue
                             ivs = ed.get(ekey)                 # стена-грань меша
