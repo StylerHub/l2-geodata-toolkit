@@ -13,17 +13,18 @@ Textures/T_XX_YY.utx (G16 heightmap 256×256, 128 юнитов на тексел
 import math
 import os
 import struct
+import sys
 
 from .formats import BLOCKS, GeoError
 from .unreal import Package, Reader, read_properties
 
 CELLS = 2048                       # ячеек на регион по оси
 # Калибровка конвенции высот: чистая формула UE2 даёт поверхность на ~43 юнита
-# ниже, чем в эталонных паках (и чем ожидает серверная экосистема).
+# ниже, чем у типовых генераторов (и чем ожидает серверная экосистема).
 # Эмпирика: океан клиента (h16=0x4040, Scale.Z=76, Loc.Z=160.65) → UE2 −4684.35,
-# в эталоне −4641. Подтверждено ретейл-спавнами (7.6k точек, 15 регионов).
+# типовой генератор −4641. Подтверждено ретейл-спавнами (7.6k точек, 15 регионов).
 Z_CALIBRATION = 43.35
-# Асимметричные пороги шага (калибровка по-ячеечным сравнением с эталонным
+# Асимметричные пороги шага (калибровка по-ячеечным сравнением с эталонной 
 # паком, 568k ячеек: 90.4% точного совпадения NSWE):
 # подъём > UP_STEP закрыт, спуск > DOWN_STEP закрыт (падать можно глубже,
 # чем запрыгивать — как в клиенте).
@@ -185,7 +186,7 @@ def terrain_cells(region, heights, holes, loc):
 
 def build_l2j(hcell, hole_cell, max_step=UP_STEP):
     """Ячейки → l2j-байты. NSWE: направление закрыто, если перепад к соседу
-    больше max_step."""
+    больше max_step (порог крутизны склона)."""
     out = bytearray()
     enc = lambda h, n: ((h << 1) & 0xFFF0) | n
     for bx in range(256):
@@ -239,45 +240,39 @@ def generate_region(client_dir, region, max_step=UP_STEP, variant='main'):
 
 # ─────────────────────────── этап 2: статик-меши ───────────────────────────
 
-# ─── пороги heightfield-ядра (пол ≤40°, стена ≥75°) ───
-WALK_NZ = 0.766        # nz/|n| ≥ cos(40°) И nz>0 → floor-спан (грань-пол, вверх);
-WALL_STEEP = 0.26      # |nz|/|n| < cos(75°) → стена-грань (почти вертикаль) даёт
-                       # рёберную блокировку NSWE; склоны 40–75° (валуны/скалы) —
-                       # не стены (иначе природа плодит ложные блокировки)
-EDGE_MIN = 32          # рёберную блокировку даёт только стена-грань с XY-размахом
-                       # ≥ этого: реальная стена/забор протяжённая, а мелкий декор
-                       # (мебель/фонари, размах ~9ю) не должен резать пол
-WALL_MIN_H = 32        # …и с вертикальным размахом ≥ этого: реальная стена высокая
-                       # (120–160ю), а тонкие кромки полок/бортики (2–8ю) — не стены
-LAYER_MERGE = 24       # floor-спаны ближе 24ю — один слой (артефакт округления
-                       # высот на 8-basis)
-AGENT_HEIGHT = 128     # клиренс: над floor-спаном нужно ≥ этого пустоты до ближайшей
-                       # поверхности сверху (потолок/пол), иначе там не встать —
-                       # это конструктивно отсекает «дно» мешей и низкие полости
-BIG_PLANE = 4096       # floor/ceiling-грань с XY-габаритом больше этого — не пол, а
-                       # зонная/водная/задняя плоскость уровня (в BSP они размером с
-                       # регион; настоящие полы интерьеров мелкие).
+# ─────────────────────── рейкаст-ядро (воксельный XYZ) ───────────────────────
+# Вместо растеризации треугольников — лучи в ячейках: Z-луч вниз даёт полы/потолки
+# (стопку поверхностей), X/Y-луч на уровне корпуса даёт стены. Полы/потолки — по
+# углу нормали грани, стены — по факту пересечения
+# горизонтального луча (свод над головой не мешает — луч идёт на уровне груди).
+WALK_NZ = 0.766        # nz/|n| ≥ cos(40°) И nz>0 → пол (грань вверх, ≤40°); нормаль
+                       # вниз → потолок/дно (порог наклона пола 40°)
+LAYER_MERGE = 24       # полы ближе 24ю — один слой (артефакт округления высот)
+AGENT_HEIGHT = 128     # клиренс: над полом нужно ≥ этого пустоты до ближайшей
+                       # поверхности сверху, иначе там не встать (отсекает «дно» мешей)
+BODY_LO = 8            # X/Y-луч стены проверяется по вертикали корпуса над полом:
+BODY_HI = 48           # грань, пересекающая (пол+BODY_LO … пол+BODY_HI) на пути к
+                       # соседу — стена. Ниже 8ю (бортик) переступаешь, выше 48ю
+                       # (свод/арка над головой) — проходишь под ней. Один луч заменяет
+                       # прежние пороги EDGE_MIN/WALL_MIN_H/CROSS и снимает «тени».
+BIG_PLANE = 4096       # горизонтальная грань с XY-габаритом больше этого — зонная/
+                       # водная плоскость уровня (в BSP они размером с регион), не пол
 
 
-def _accumulate_spans(tris, west, north):
-    """Растеризация геометрии в heightfield-спаны floor/ceiling (Recast-style).
-
-    Каждый треугольник по нормали раскидывается по накрытым ячейкам с
-    вертикальным пересечением в центре ячейки:
-      floors[cell] → list[z] — грань-пол (пологая, нормаль ВВЕРХ, наклон ≤40°);
-      ceils[cell]  → list[z] — потолок/дно (пологая, нормаль ВНИЗ) — не пол, но
-                     ограничивает клиренс полов под ним (_span_layers).
-    Крутые грани (стены зданий/оград) → рёберные блокировки NSWE: закрывают
-    КОНКРЕТНУЮ границу ячейки (одно направление), а не глушат клетку целиком —
-    как в реальной геодате. Огромная горизонталь
-    ИЛИ вертикаль (>BIG_PLANE) — зонная/водная плоскость уровня, не пол и не
-    стена (иначе граница зоны дала бы лавину ложных блокировок в поле)."""
-    floors = {}
-    ceils = {}
-    edges_x = {}
-    edges_y = {}
-    for tri in tris:
-        (ax, ay, az), (bx, by, bz), (cx, cy, cz) = tri
+def _prep_geometry(tris, west, north):
+    """Один проход по треугольникам: классификация + предпосчёт. Возвращает
+    (fc, fc_grid, walls, w_grid):
+      fc[i]    — грань-пол/потолок с предпосчитанным барицентриком для Z-луча;
+      fc_grid  — индекс (cell → индексы fc), покрытие по XY-bbox;
+      walls[i] — крутая грань с предпосчитанными рёбрами e1,e2 для segment-теста;
+      w_grid   — индекс (cell → индексы walls).
+    Нормали, наклон, барицентрик и рёбра считаются здесь ОДИН раз, а не в каждом
+    луче — результат лучей идентичен, меняется только скорость."""
+    fc = []
+    walls = []
+    fc_grid = {}
+    w_grid = {}
+    for (ax, ay, az), (bx, by, bz), (cx, cy, cz) in tris:
         ux, uy, uz = bx - ax, by - ay, bz - az
         vx, vy, vz = cx - ax, cy - ay, cz - az
         nx = uy * vz - uz * vy
@@ -286,115 +281,107 @@ def _accumulate_spans(tris, west, north):
         ln2 = nx * nx + ny * ny + nz * nz
         if ln2 <= 0:
             continue
-        x0, x1 = min(ax, bx, cx), max(ax, bx, cx)
-        y0, y1 = min(ay, by, cy), max(ay, by, cy)
-        if x1 - x0 > BIG_PLANE or y1 - y0 > BIG_PLANE:  # зонная/водная плоскость
-            continue
-        slope = abs(nz) / math.sqrt(ln2)
-        if slope < WALK_NZ:                       # круче 40° — не пол/потолок
-            # стена-грань → рёберная блокировка, но ТОЛЬКО реальная стена/забор:
-            # протяжённая по XY (≥EDGE_MIN) И высокая по Z (≥WALL_MIN_H). Мелкий
-            # декор (мебель/фонари, XY~9ю) и тонкие кромки полок/бортики (z-размах
-            # 2–8ю) НЕ блокируют — иначе ложные красные рёбра на ровном полу; подход
-            # к твёрдому декору и так закрыт перепадом высот.
-            zspan = max(az, bz, cz) - min(az, bz, cz)
-            if (slope < WALL_STEEP and max(x1 - x0, y1 - y0) >= EDGE_MIN
-                    and zspan >= WALL_MIN_H):
-                _edge_cross(edges_x, edges_y, (ax, ay, az), (bx, by, bz),
-                            (cx, cy, cz), west, north)
-            # 40°–75° — крутой склон (валун/скала): ни пол, ни стена; закрытость
-            # такого места даёт перепад высот соседей, а не рёберная блокировка
-            continue
-        gx0 = max(0, int((x0 - west) // 16))
-        gx1 = min(CELLS - 1, int((x1 - west) // 16))
-        gy0 = max(0, int((y0 - north) // 16))
-        gy1 = min(CELLS - 1, int((y1 - north) // 16))
+        gx0 = max(0, int((min(ax, bx, cx) - west) // 16))
+        gx1 = min(CELLS - 1, int((max(ax, bx, cx) - west) // 16))
+        gy0 = max(0, int((min(ay, by, cy) - north) // 16))
+        gy1 = min(CELLS - 1, int((max(ay, by, cy) - north) // 16))
         if gx1 < gx0 or gy1 < gy0:
             continue
-        d00 = vx * vx + vy * vy
-        d01 = vx * ux + vy * uy
-        d11 = ux * ux + uy * uy
-        den = d00 * d11 - d01 * d01
-        if abs(den) < 1e-9:
-            continue
-        inv = 1.0 / den
-        bucket = floors if nz > 0 else ceils     # вверх — пол, вниз — потолок/дно
-        for gy in range(gy0, gy1 + 1):
-            py = north + gy * 16 + 8 - ay
-            for gx in range(gx0, gx1 + 1):
-                px = west + gx * 16 + 8 - ax
-                d02 = vx * px + vy * py
-                d12 = ux * px + uy * py
-                u = (d11 * d02 - d01 * d12) * inv
-                v = (d00 * d12 - d01 * d02) * inv
-                if u >= -0.02 and v >= -0.02 and u + v <= 1.02:
-                    z = az + u * vz + v * uz      # bary: P = A + u*AC + v*AB
-                    if -16384 <= z <= 16376:      # плоскости мирового куба — мимо
-                        bucket.setdefault(gy * CELLS + gx, []).append(int(z))
-    return floors, ceils, edges_x, edges_y
-
-
-def _edge_cross(edges_x, edges_y, A, B, C, west, north):
-    """Пересечения стеновой грани с сетками x=const и y=const → z-интервалы на
-    границах ячеек. edges_x[(gx,gy)] — граница между (gx-1,gy) и (gx,gy);
-    edges_y[(gx,gy)] — между (gx,gy-1) и (gx,gy)."""
-    for axis, edges in ((0, edges_x), (1, edges_y)):
-        origin = west if axis == 0 else north
-        lo = min(A[axis], B[axis], C[axis])
-        hi = max(A[axis], B[axis], C[axis])
-        k0 = int((lo - origin) // 16) + 1
-        k1 = int((hi - origin) // 16)
-        for k in range(max(k0, 1), min(k1, CELLS - 1) + 1):
-            plane = origin + k * 16
-            pts = []
-            for P, Q in ((A, B), (B, C), (C, A)):
-                d0, d1 = P[axis] - plane, Q[axis] - plane
-                if d0 == d1:
-                    continue
-                if d0 * d1 <= 0:
-                    t = d0 / (d0 - d1)
-                    other = 1 - axis
-                    o = P[other] + t * (Q[other] - P[other])
-                    z = P[2] + t * (Q[2] - P[2])
-                    pts.append((o, z))
-            if len(pts) < 2:
+        if abs(nz) < WALK_NZ * math.sqrt(ln2):        # крутая → стена
+            wi = len(walls)
+            walls.append((ax, ay, az, ux, uy, uz, vx, vy, vz))  # e1=(u), e2=(v)
+            grid = w_grid
+            idx = wi
+        else:                                          # пологая → пол/потолок
+            if (max(ax, bx, cx) - min(ax, bx, cx) > BIG_PLANE or
+                    max(ay, by, cy) - min(ay, by, cy) > BIG_PLANE):
+                continue                               # зонная/водная плоскость
+            d00 = vx * vx + vy * vy
+            d01 = vx * ux + vy * uy
+            d11 = ux * ux + uy * uy
+            den = d00 * d11 - d01 * d01
+            if abs(den) < 1e-9:
                 continue
-            (o1, z1), (o2, z2) = pts[0], pts[-1]
-            if o2 < o1:
-                o1, o2, z1, z2 = o2, o1, z2, z1
-            oorigin = north if axis == 0 else west
-            c0 = max(0, int((o1 - oorigin) // 16))
-            c1 = min(CELLS - 1, int((o2 - oorigin) // 16))
-            for c in range(c0, c1 + 1):
-                s_lo = max(o1, oorigin + c * 16)
-                s_hi = min(o2, oorigin + (c + 1) * 16)
-                if o2 > o1:
-                    t_lo = (s_lo - o1) / (o2 - o1)
-                    t_hi = (s_hi - o1) / (o2 - o1)
-                    za = z1 + t_lo * (z2 - z1)
-                    zb = z1 + t_hi * (z2 - z1)
+            fi = len(fc)
+            fc.append((nz > 0, ax, ay, az, ux, uy, uz, vx, vy, vz,
+                       d00, d01, d11, 1.0 / den))
+            grid = fc_grid
+            idx = fi
+        for gy in range(gy0, gy1 + 1):
+            row = gy * CELLS
+            for gx in range(gx0, gx1 + 1):
+                grid.setdefault(row + gx, []).append(idx)
+    return fc, fc_grid, walls, w_grid
+
+
+def _column(px, py, fc_idx, fc):
+    """Z-луч вниз в (px, py): пересечения вертикали с предпосчитанными гранями-
+    полами/потолками ячейки → (floors, ceils). Барицентрик уже готов в fc[i]."""
+    floors = []
+    ceils = []
+    for fi in fc_idx:
+        (is_floor, ax, ay, az, ux, uy, uz, vx, vy, vz,
+         d00, d01, d11, inv) = fc[fi]
+        pxr = px - ax
+        pyr = py - ay
+        d02 = vx * pxr + vy * pyr
+        d12 = ux * pxr + uy * pyr
+        u = (d11 * d02 - d01 * d12) * inv
+        v = (d00 * d12 - d01 * d02) * inv
+        if u < -0.02 or v < -0.02 or u + v > 1.02:
+            continue
+        z = az + u * vz + v * uz
+        if not (-16384 <= z <= 16376):
+            continue
+        (floors if is_floor else ceils).append(int(z))
+    return floors, ceils
+
+
+def _wall_between(px, py, npx, npy, z, w_idx, walls):
+    """X/Y-луч: проход закрыт, только если стена — СПЛОШНАЯ преграда по корпусу:
+    крутая грань(и) пересекают горизонтальный отрезок [центр→сосед] И на нижней
+    высоте (пол+BODY_LO, щиколотка), И на верхней (пол+BODY_HI, грудь). Так
+    ступенька (низ есть, верха нет — переступаешь) и нависающий выступ/карниз
+    (верх есть, низа нет — проходишь под) стеной НЕ считаются. Рёбра e1,e2
+    предпосчитаны; Möller–Trumbore для сегмента."""
+    dx = npx - px
+    dy = npy - py
+    hit_lo = False
+    hit_hi = False
+    for wi in w_idx:
+        ax, ay, az, e1x, e1y, e1z, e2x, e2y, e2z = walls[wi]
+        # h = d × e2, d = (dx, dy, 0)  (отрезок горизонтальный → dz = 0)
+        hx = dy * e2z
+        hy = -dx * e2z
+        hz = dx * e2y - dy * e2x
+        a = e1x * hx + e1y * hy + e1z * hz
+        if -1e-9 < a < 1e-9:
+            continue
+        f = 1.0 / a
+        sx, sy = px - ax, py - ay
+        for lo in (True, False):                     # низ (щиколотка) и верх (грудь)
+            if (hit_lo and lo) or (hit_hi and not lo):
+                continue
+            zc = z + (BODY_LO if lo else BODY_HI)
+            sz = zc - az
+            uu = f * (sx * hx + sy * hy + sz * hz)
+            if uu < 0.0 or uu > 1.0:
+                continue
+            qx = sy * e1z - sz * e1y
+            qy = sz * e1x - sx * e1z
+            qz = sx * e1y - sy * e1x
+            vv = f * (dx * qx + dy * qy)
+            if vv < 0.0 or uu + vv > 1.0:
+                continue
+            t = f * (e2x * qx + e2y * qy + e2z * qz)
+            if 0.0 <= t <= 1.0:
+                if lo:
+                    hit_lo = True
                 else:
-                    za, zb = z1, z2
-                key = (k, c) if axis == 0 else (c, k)
-                lst = edges.setdefault(key, [])
-                iv = (min(za, zb), max(za, zb))
-                if not (lst and lst[-1] == iv):
-                    lst.append(iv)
-
-
-CROSS_LO = 24    # стена перекрывает шаг, если её z-интервал пересекает корпус
-CROSS_HI = 64    # персонажа над слоем: (z+CROSS_LO, z+CROSS_HI). Верх = рост
-                 # персонажа: геометрия выше (своды/арки/балки над головой) НЕ
-                 # блокирует пол под собой — иначе рисует «тени» на проходе
-
-
-def _edge_blocked(intervals, z):
-    """Есть ли стена-интервал, перекрывающий корпус персонажа над слоем z."""
-    for wlo, whi in intervals:
-        if whi > z + CROSS_LO and wlo < z + CROSS_HI:
+                    hit_hi = True
+        if hit_lo and hit_hi:
             return True
-    return False
-
+    return hit_lo and hit_hi
 
 
 def _span_layers(floor_zs, ceil_zs, base):
@@ -560,38 +547,53 @@ def _blocking_edges(blocking, west, north):
     return blocked
 
 
-def build_l2j_full(hcell, hole_cell, floors, ceils, max_step=UP_STEP, blocked=(),
-                   edges_x=None, edges_y=None):
-    """Рельеф + heightfield-спаны → l2j с multilayer; NSWE по перепаду высот
-    (+ рёберные блокировки: стены мешей edges_x/y и BlockingVolume blocked)."""
-    blocked = blocked or set()
-    edges_x = edges_x or {}
-    edges_y = edges_y or {}
-    # слои по ячейкам: рельеф (всегда проходим) + полы мешей с клиренсом по
-    # потолкам. Рельеф не гасится — глухих ячеек почти нет (как в реальной
-    # геодате). Дыры QuadVisibilityBitmap НЕ делаем непроходимыми: в застройке
-    # это зоны, где террейн заменён мешем-мостовой, а не провалы; эталонная
-    # геодата тоже трактует их как проходимый рельеф (иначе город глухой на 5%).
-    cell_layers = {}
-    for cell in set(floors) | set(ceils):
-        gy, gx = divmod(cell, CELLS)
-        ls = _span_layers(floors.get(cell, ()), ceils.get(cell, ()), [hcell[gy][gx]])
-        if ls:
-            cell_layers[cell] = ls
-    _prune_unreachable(cell_layers, hcell, hole_cell, max_step)
+def _raycast_backend(fc, fc_grid, walls, w_grid, hcell, hole_cell, west, north,
+                     max_step, blocked):
+    """Полный конвейер лучей+сборки NSWE на GPU/CPU через Taichi, если он
+    установлен и работает: Z-луч (слои) → отсечение недостижимого → X/Y-луч
+    (стены) → NSWE всех слоёв грида. Возвращает (cell_layers, nswe_flat, l_off) —
+    готовые для упаковки в build_l2j_ray, либо (None, None, None) → build посчитает
+    на чистом Python. Результат байт-в-байт совпадает с Python (f64); любой сбой
+    Taichi — тихий откат."""
+    try:
+        from . import raycast_ti as RT
+    except Exception:
+        return None, None, None
+    if not RT.available() or RT.init() is None:
+        return None, None, None
+    try:
+        cells = list(fc_grid)
+        oz, ofl, ocnt = RT.zray_columns(fc, fc_grid, west, north, cells, WALK_NZ)
+        cell_layers = {}
+        for i, cell in enumerate(cells):
+            gy, gx = divmod(cell, CELLS)
+            fl = [int(oz[i, k]) for k in range(ocnt[i]) if ofl[i, k] == 1]
+            ce = [int(oz[i, k]) for k in range(ocnt[i]) if ofl[i, k] == 0]
+            ls = _span_layers(fl, ce, [hcell[gy][gx]])
+            if ls:
+                cell_layers[cell] = ls
+        _prune_unreachable(cell_layers, hcell, hole_cell, max_step)   # ДО NSWE
+        # NSWE всех слоёв грида на устройстве (Z-луч слои готовы; стены X/Y-лучом
+        # и height/blocked/anti-глухая — всё в одном ядре)
+        nswe_flat, l_off = RT.nswe_grid(cell_layers, hcell, walls, w_grid, blocked,
+                                        west, north, max_step, DOWN_STEP,
+                                        BODY_LO, BODY_HI)
+        return cell_layers, nswe_flat, l_off
+    except Exception:
+        return None, None, None                        # сбой → чистый Python
 
-    def layers_at(gx, gy):
-        cell = gy * CELLS + gx
-        ls = cell_layers.get(cell)
-        if ls is not None:
-            return ls
-        return (hcell[gy][gx],)
 
+def _pack_layers(hcell, cell_layers, nswe_flat, l_off, progress_cb=None):
+    """Упаковка готовых слоёв+NSWE (посчитанных на устройстве) в байты L2J.
+    nswe_flat[l_off[cell]+j] — nswe j-го слоя ячейки; порядок слоёв совпадает с ls
+    (рельеф — слой 0, либо cell_layers). Сериализация идентична build_l2j_ray."""
     def enc(h, n):
         h = max(-16384, min(16376, h))
         return ((h << 1) & 0xFFF0) | n
     out = bytearray()
     for bx in range(256):
+        if progress_cb:
+            progress_cb(bx, 256)
         for by in range(256):
             cells = []
             multi = False
@@ -601,44 +603,123 @@ def build_l2j_full(hcell, hole_cell, floors, ceils, max_step=UP_STEP, blocked=()
                 gx = bx * 8 + cx
                 for cy in range(8):
                     gy = by * 8 + cy
-                    ls = layers_at(gx, gy) or (hcell[gy][gx],)  # рельеф — минимум
+                    cell = gy * CELLS + gx
+                    ls = cell_layers.get(cell)
+                    if ls is None:
+                        ls = (hcell[gy][gx],)
+                    o = int(l_off[cell])
+                    lay = [(z, int(nswe_flat[o + j])) for j, z in enumerate(ls)]
+                    cells.append(lay)
+                    if len(lay) > 1:
+                        multi = True
+                    if lay[0][1] != 15:
+                        flat_ok = False
+                    hs.add(lay[0][0] & 0xFFF8)
+            if multi:
+                out.append(2)
+                for lay in cells:
+                    out.append(len(lay))
+                    for z, n in lay:
+                        out += struct.pack('<H', enc(z, n))
+            elif flat_ok and len(hs) == 1:
+                out.append(0)
+                out += struct.pack('<h', cells[0][0][0])
+            else:
+                out.append(1)
+                for lay in cells:
+                    out += struct.pack('<H', enc(*lay[0]))
+    if progress_cb:
+        progress_cb(256, 256)
+    return bytes(out)
+
+
+def build_l2j_ray(hcell, hole_cell, fc, fc_grid, walls, w_grid, west, north,
+                  max_step=UP_STEP, blocked=(), progress_cb=None,
+                  cell_layers=None, nswe_flat=None, l_off=None):
+    """Рельеф + рейкаст мешей → l2j с multilayer. Слои — Z-лучом в центре ячейки
+    (полы/потолки/клиренс); NSWE — перепадом высот соседей И X/Y-лучом на уровне
+    корпуса (стены). Два режима: (1) готовый NSWE из Taichi-бэкенда (nswe_flat/
+    l_off) — только упаковка байт; (2) чистый Python — Z-луч + отсечение + NSWE +
+    упаковка на лету, байт-в-байт идентично. Рейкаст только в ячейках с геометрией;
+    открытое поле и дыры — рельеф напрямую."""
+    blocked = blocked or set()
+    # ── режим 1: NSWE посчитан на устройстве, осталась лишь упаковка ──
+    if nswe_flat is not None:
+        return _pack_layers(hcell, cell_layers, nswe_flat, l_off, progress_cb)
+
+    # ── режим 2: всё на чистом Python ──
+    if cell_layers is None:                             # чистый Python Z-луч
+        cell_layers = {}
+        for cell, fc_idx in fc_grid.items():
+            gy, gx = divmod(cell, CELLS)
+            px = west + gx * 16 + 8
+            py = north + gy * 16 + 8
+            fl, ce = _column(px, py, fc_idx, fc)
+            ls = _span_layers(fl, ce, [hcell[gy][gx]])
+            if ls:
+                cell_layers[cell] = ls
+    _prune_unreachable(cell_layers, hcell, hole_cell, max_step)
+
+    def layers_at(gx, gy):
+        ls = cell_layers.get(gy * CELLS + gx)
+        return ls if ls is not None else (hcell[gy][gx],)
+
+    def enc(h, n):
+        h = max(-16384, min(16376, h))
+        return ((h << 1) & 0xFFF0) | n
+    out = bytearray()
+    for bx in range(256):
+        if progress_cb:                              # прогресс на каждый блок (256 строк) —
+            progress_cb(bx, 256)                     # частые тики, чтобы не казалось «висит»
+        for by in range(256):
+            cells = []
+            multi = False
+            flat_ok = True
+            hs = set()
+            for cx in range(8):
+                gx = bx * 8 + cx
+                for cy in range(8):
+                    gy = by * 8 + cy
+                    cell = gy * CELLS + gx
+                    ls = layers_at(gx, gy) or (hcell[gy][gx],)
+                    px = west + gx * 16 + 8
+                    py = north + gy * 16 + 8
+                    wti = w_grid.get(cell)              # стены-грани ячейки
                     lay = []
                     for z in ls:
                         nswe = 15
-                        # NSWE как в реальной геодате (~60% блокировок —
-                        # стены, ~40% — склоны). Направление закрыто, если: у соседа
-                        # нет слоя в пределах шага по высоте (склон/обрыв); ИЛИ
-                        # границу перекрывает стена-грань меша (edges_x/y с z-интер-
-                        # валом на уровне корпуса персонажа); ИЛИ BlockingVolume.
-                        wall_bits = 0                          # закрытые ТОЛЬКО стеной
-                        for bit, ngx, ngy, bkey, ekey, ed in (
-                                (8, gx, gy - 1, ('y', gx, gy), (gx, gy), edges_y),
-                                (4, gx, gy + 1, ('y', gx, gy + 1), (gx, gy + 1), edges_y),
-                                (2, gx - 1, gy, ('x', gx, gy), (gx, gy), edges_x),
-                                (1, gx + 1, gy, ('x', gx + 1, gy), (gx + 1, gy), edges_x)):
+                        wall_bits = 0                   # закрытые ТОЛЬКО стеной
+                        for di, (bit, ngx, ngy, bkey) in enumerate((
+                                (8, gx, gy - 1, ('y', gx, gy)),
+                                (4, gx, gy + 1, ('y', gx, gy + 1)),
+                                (2, gx - 1, gy, ('x', gx, gy)),
+                                (1, gx + 1, gy, ('x', gx + 1, gy)))):
                             if not (0 <= ngx < CELLS and 0 <= ngy < CELLS):
                                 continue
                             nls = layers_at(ngx, ngy)
                             height_ok = any(_step_ok(nz - z, max_step) for nz in nls)
-                            if bkey in blocked:                # BlockingVolume
+                            if bkey in blocked:          # BlockingVolume
                                 nswe &= ~bit
-                                if height_ok:                  # ровно — снимаемо anti-глухой
+                                if height_ok:
                                     wall_bits |= bit
                                 continue
                             if not height_ok:
-                                nswe &= ~bit                   # перепад высот (склон/обрыв)
+                                nswe &= ~bit             # перепад высот (склон/обрыв)
                                 continue
-                            ivs = ed.get(ekey)                 # стена-грань меша
-                            if ivs and _edge_blocked(ivs, z):
+                            # X/Y-луч: стена между полами на уровне корпуса
+                            nwti = w_grid.get(ngy * CELLS + ngx)
+                            is_wall = False
+                            if wti or nwti:
+                                seg_w = (wti or []) + (nwti or [])
+                                npx = west + ngx * 16 + 8
+                                npy = north + ngy * 16 + 8
+                                is_wall = _wall_between(px, py, npx, npy, z, seg_w, walls)
+                            if is_wall:
                                 nswe &= ~bit
                                 wall_bits |= bit
                         # anti-глухая: тонкий вертикальный объект (ствол/столб) не
-                        # должен запирать проходимую клетку со всех сторон — если её
-                        # заперли ТОЛЬКО стены, возвращаем сторону обхода. Держим
-                        # правило для всех ячеек: глухих в разы меньше эталона, ходьба
-                        # чистая. Известный компромисс — полностью замкнутый рукотвор-
-                        # ный карман 1×1 (чулан без двери) станет односторонне прохо-
-                        # димым; в реальных картах это ничтожно редко.
+                        # запирает проходимую клетку со всех сторон — если заперли
+                        # ТОЛЬКО стены, возвращаем сторону обхода.
                         if nswe == 0 and wall_bits:
                             nswe = wall_bits
                         lay.append((z, nswe))
@@ -661,6 +742,8 @@ def build_l2j_full(hcell, hole_cell, floors, ceils, max_step=UP_STEP, blocked=()
                 out.append(1)
                 for lay in cells:
                     out += struct.pack('<H', enc(*lay[0]))
+    if progress_cb:
+        progress_cb(256, 256)
     return bytes(out)
 
 
@@ -680,26 +763,54 @@ def generate_region_full(client_dir, region, max_step=UP_STEP, progress_cb=None,
     west, north = (rx - 20) * REGION_UNITS, (ry - 18) * REGION_UNITS
     from .unreal import Package
     unr = map_path(maps_dir, region, variant)
-    tris, skipped = region_mesh_triangles(unr, usx_dir, progress_cb)
+    tris, skipped = region_mesh_triangles(unr, usx_dir)   # парсинг мешей (быстрый)
     from .meshes import level_extra_triangles
     solid, blocking = level_extra_triangles(Package(unr))
     # конвенция высот едина для всего: меши и BSP сдвигаются так же, как рельеф
     zc = Z_CALIBRATION
-    tris = [tuple((x, y, z + zc) for x, y, z in t) for t in tris]
-    solid = [tuple((x, y, z + zc) for x, y, z in t) for t in solid]
-    # Единый heightfield: статик-меши + BSP-модель уровня растеризуются в спаны
-    # floor/ceiling. Клиренс, классификация нормали (дно/потолок ≠ пол) и фильтр
-    # BIG_PLANE (region-плоскости зон/воды) конструктивно убирают паразитные слои.
-    # Проходимость NSWE — по перепаду высот соседей , плюс
-    # заградительные рёбра BlockingVolume (невидимые границы играбельной зоны).
-    floors, ceils, edges_x, edges_y = _accumulate_spans(tris + solid, west, north)
+    allt = [tuple((x, y, z + zc) for x, y, z in t) for t in (tris + solid)]
+    # Рейкаст-ядро (воксельный XYZ): пространственный индекс
+    # мешей + BSP-модели, Z-луч даёт полы/потолки, X/Y-луч на уровне корпуса — стены.
+    # Рельеф (heightmap) — базовый пол везде, лучи только в ячейках с геометрией.
+    fc, fc_grid, walls, w_grid = _prep_geometry(allt, west, north)
     blocked = _blocking_edges(blocking, west, north)
-    data = build_l2j_full(hcell, hole_cell, floors, ceils, max_step, blocked,
-                          edges_x, edges_y)
-    return data, len(tris) + len(solid), skipped
+    # GPU/CPU-бэкенд Taichi для лучей (если установлен), иначе чистый Python.
+    # Результат байт-в-байт идентичен (f64): устройство без f64 (Metal) Taichi
+    # сам отбрасывает и считает на CPU. Слои/стены готовим здесь, сборку L2J —
+    # в build_l2j_ray.
+    cell_layers, nswe_flat, l_off = _raycast_backend(
+        fc, fc_grid, walls, w_grid, hcell, hole_cell, west, north, max_step, blocked)
+    data = build_l2j_ray(hcell, hole_cell, fc, fc_grid, walls, w_grid, west, north,
+                         max_step, blocked, progress_cb, cell_layers, nswe_flat, l_off)
+    return data, len(allt), skipped
 
 
 # ─────────────────────────── команда generate ───────────────────────────
+
+_PROGRESS_Q = None    # очередь тиков прогресса воркера → главный процесс
+
+
+def _drain_progress(pq, active):
+    """Вычерпать все тики из очереди в active: (region,variant) → (done,total);
+    'done' удаляет регион из активных."""
+    import queue as _q
+    while True:
+        try:
+            r, v, d = pq.get_nowait()[:3]
+        except (_q.Empty, Exception):
+            return
+        if d == 'done':
+            active.pop((r, v), None)
+        else:
+            # d — done-блоки; total лежит четвёртым элементом тика
+            active[(r, v)] = (d, 256)
+
+
+def _init_worker(q):
+    """Инициализатор процесса пула: запоминает очередь прогресса."""
+    global _PROGRESS_Q
+    _PROGRESS_Q = q
+
 
 def _worker(job):
     """Один регион одного варианта (для пула процессов).
@@ -708,24 +819,31 @@ def _worker(job):
     os.replace → каноничный .l2j появляется только целым и проверенным.
     Прерывание (Ctrl+C/terminate) в момент записи оставит максимум .tmp,
     но никогда — обрезанный или невалидный .l2j.
-    """
+    Прогресс рейкаста шлётся в _PROGRESS_Q тиками (region, variant, done, total),
+    завершение — (region, variant, 'done')."""
     client_dir, region, variant, out_path, max_step, terrain_only = job
     tmp = out_path + '.tmp'
+    q = _PROGRESS_Q
+    cb = (lambda d, t: q.put((region, variant, d, t))) if q is not None else None
     try:
         if terrain_only:
             data = generate_region(client_dir, region, max_step, variant)
         else:
             data, _n, _s = generate_region_full(client_dir, region, max_step,
-                                                variant=variant)
+                                                cb, variant)
         with open(tmp, 'wb') as f:
             f.write(data)
         from .convert import validate_l2j
         validate_l2j(tmp)
         os.replace(tmp, out_path)                 # атомарная подмена
+        if q is not None:
+            q.put((region, variant, 'done'))
         return (region, variant, None)
     except BaseException as e:                     # incl. KeyboardInterrupt/SystemExit
         if os.path.exists(tmp):
             os.remove(tmp)
+        if q is not None:
+            q.put((region, variant, 'done'))
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
         return (region, variant, f'{type(e).__name__}: {e}')
@@ -821,37 +939,101 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
     ok, errors, done = 0, [], 0
     total = len(tasks)
     aborted = False
-    # воркеры игнорируют SIGINT — прерывание ловит только главный процесс,
-    # чтобы Ctrl+C не сыпал трейсбеками из пула
-    import signal
-    orig = signal.signal(signal.SIGINT, signal.SIG_IGN)
-    pool = mp.Pool(nproc)
-    signal.signal(signal.SIGINT, orig)
-    try:
-        for i, (region, variant, err) in enumerate(
-                pool.imap_unordered(_worker, tasks), 1):
-            done = i
-            if err is None:
-                ok += 1
-            else:
-                errors.append((f'{region}/{variant}', err))
-            progress(i, total, 'генерация ')
-    except KeyboardInterrupt:
-        aborted = True
-        pool.terminate()
-        print(dim(f'\n  прервано на {done}/{total} — готовые {ok} файлов сохранены.'))
-    else:
-        pool.close()
-    finally:
-        pool.join()
-        # подчистить .tmp-огрызки прерванных записей (SIGTERM мог убить до уборки)
-        import glob as _g2
-        for sub in ('main', 'classic'):
-            for t in _g2.glob(os.path.join(out_dir, sub, '*.l2j.tmp')):
+    if total <= 3:
+        # мало квадратов → последовательно, с прогрессом-ETA ВНУТРИ региона (по
+        # блокам): видно, сколько осталось до конца квадрата, а не только 0→100%.
+        from .convert import validate_l2j
+        try:
+            for i, (cl, region, variant, out_path, ms, terr) in enumerate(tasks, 1):
+                def cb(d, t, _r=region, _v=variant):
+                    progress(d, t, f'  {_r} [{_v}] ')
+                tmp = out_path + '.tmp'
                 try:
-                    os.remove(t)
-                except OSError:
-                    pass
+                    if terr:
+                        data = generate_region(cl, region, ms, variant)
+                        cb(256, 256)
+                    else:
+                        data, _n, _s = generate_region_full(cl, region, ms, cb, variant)
+                    with open(tmp, 'wb') as f:
+                        f.write(data)
+                    validate_l2j(tmp)
+                    os.replace(tmp, out_path)
+                    ok += 1
+                except KeyboardInterrupt:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    raise
+                except BaseException as e:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                    errors.append((f'{region}/{variant}', f'{type(e).__name__}: {e}'))
+                done = i
+        except KeyboardInterrupt:
+            aborted = True
+            print(dim(f'\n  прервано на {done}/{total} — готовые {ok} сохранены.'))
+    else:
+        # воркеры игнорируют SIGINT — прерывание ловит только главный процесс,
+        # чтобы Ctrl+C не сыпал трейсбеками из пула. Прогресс воркеров идёт через
+        # очередь: главный процесс рисует общий счётчик файлов + активные регионы
+        # с их процентами (видно движение внутри каждого, а не только N/total).
+        import signal
+        import time as _tt
+        import queue as _queue
+        from .ui import fmt_dur, cyan as _cyan
+        mgr = mp.Manager()
+        pq = mgr.Queue()
+        orig = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        pool = mp.Pool(nproc, _init_worker, (pq,))
+        signal.signal(signal.SIGINT, orig)
+        asyncs = [pool.apply_async(_worker, (job,)) for job in tasks]
+        active = {}                                  # (region, variant) → (done, total)
+        results_seen = [False] * total
+        t0b = _tt.monotonic()
+        try:
+            while True:
+                _drain_progress(pq, active)          # вычерпать тики прогресса
+                completed = sum(1 for a in asyncs if a.ready())
+                # отрисовка: общий бар + активные регионы
+                w = 24
+                frac = completed / total if total else 1.0
+                bar = '█' * int(w * frac) + '░' * (w - int(w * frac))
+                el = _tt.monotonic() - t0b
+                eta = ('~' + fmt_dur(el / completed * (total - completed))
+                       if completed and el > 1 else '')
+                act = ' · '.join(
+                    f'{r} {min(99, d * 100 // t)}%'
+                    for (r, v), (d, t) in sorted(active.items())[:5] if t)
+                line = (f'\r  генерация {_cyan(bar)} {frac:5.1%} ({completed}/{total})'
+                        f' {eta}' + (f'  │ {act}' if act else ''))
+                sys.stdout.write(line[:220] + ' ' * 6)
+                sys.stdout.flush()
+                if completed >= total:
+                    break
+                _tt.sleep(0.25)
+            sys.stdout.write('\n')
+            for a in asyncs:
+                region, variant, err = a.get()
+                done += 1
+                if err is None:
+                    ok += 1
+                else:
+                    errors.append((f'{region}/{variant}', err))
+        except KeyboardInterrupt:
+            aborted = True
+            pool.terminate()
+            print(dim(f'\n  прервано на {done}/{total} — готовые {ok} файлов сохранены.'))
+        else:
+            pool.close()
+        finally:
+            pool.join()
+            # подчистить .tmp-огрызки прерванных записей (SIGTERM мог убить до уборки)
+            import glob as _g2
+            for sub in ('main', 'classic'):
+                for t in _g2.glob(os.path.join(out_dir, sub, '*.l2j.tmp')):
+                    try:
+                        os.remove(t)
+                    except OSError:
+                        pass
     if aborted:
         return 130
     print(f'\n  {bold("Итог")} за {(_t.time() - t0) / 60:.1f} мин:'

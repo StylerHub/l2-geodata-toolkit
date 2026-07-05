@@ -15,6 +15,18 @@ from .formats import GeoError
 
 # ─────────────────────────── дешифровка ───────────────────────────
 
+_XOR_TABLES = {}
+
+
+def _xor_table(key):
+    """Таблица трансляции b → b^key (кэш по ключу)."""
+    t = _XOR_TABLES.get(key)
+    if t is None:
+        t = bytes(i ^ key for i in range(256))
+        _XOR_TABLES[key] = t
+    return t
+
+
 def decrypt(path):
     """Файл клиента → расшифрованные байты пакета UE2."""
     raw = open(path, 'rb').read()
@@ -32,7 +44,9 @@ def decrypt(path):
         key = sum(ord(c) for c in os.path.basename(path).lower()) & 0xFF
     else:
         raise GeoError(f'{os.path.basename(path)}: шифрование Ver{ver} не поддерживается')
-    data = bytes(b ^ key for b in body)
+    # XOR всего тела на константный ключ — через таблицу трансляции (C-скорость,
+    # ×100 против побайтового генератора; результат идентичен)
+    data = body.translate(_xor_table(key))
     if data[:4] != b'\xc1\x83\x2a\x9e':
         raise GeoError(f'{os.path.basename(path)}: после дешифровки нет сигнатуры UE-пакета')
     return data
