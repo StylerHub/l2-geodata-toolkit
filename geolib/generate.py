@@ -219,7 +219,7 @@ def build_l2j(hcell, hole_cell, max_step=UP_STEP):
                     hs.add(h & 0xFFF8)
             if all_open and len(hs) == 1:
                 out.append(0)
-                out += struct.pack('<h', cells[0][0])
+                out += struct.pack('<h', max(-16384, min(16376, cells[0][0])))
             else:
                 out.append(1)
                 for h, n in cells:
@@ -439,7 +439,7 @@ def _prune_unreachable(cell_layers, hcell, hole_cell, max_step):
         gy, gx = divmod(cell, CELLS)
         own_t = None if hole_cell[gy][gx] else hcell[gy][gx]
         for li, z in enumerate(ls):
-            root = own_t is not None and _step_ok(z - own_t)
+            root = own_t is not None and _step_ok(z - own_t, max_step)
             if not root:
                 # шаг с чистого соседнего рельефа (ячейки без полов)
                 for ngx, ngy in ((gx, gy - 1), (gx, gy + 1), (gx - 1, gy), (gx + 1, gy)):
@@ -448,7 +448,7 @@ def _prune_unreachable(cell_layers, hcell, hole_cell, max_step):
                     ncell = ngy * CELLS + ngx
                     if ncell in cell_layers or hole_cell[ngy][ngx]:
                         continue
-                    if _step_ok(z - hcell[ngy][ngx]):
+                    if _step_ok(z - hcell[ngy][ngx], max_step):
                         root = True
                         break
             if root:
@@ -555,11 +555,13 @@ def _raycast_backend(fc, fc_grid, walls, w_grid, hcell, hole_cell, west, north,
     готовые для упаковки в build_l2j_ray, либо (None, None, None) → build посчитает
     на чистом Python. Результат байт-в-байт совпадает с Python (f64); любой сбой
     Taichi — тихий откат."""
+    if not fc_grid:                                    # регион без геометрии —
+        return None, None, None                        # рельеф сам, Taichi не нужен
     try:
         from . import raycast_ti as RT
+        if not RT.available() or RT.init() is None:    # init внутри try: сбой
+            return None, None, None                    # Taichi/LLVM → тихий откат
     except Exception:
-        return None, None, None
-    if not RT.available() or RT.init() is None:
         return None, None, None
     try:
         cells = list(fc_grid)
@@ -623,7 +625,7 @@ def _pack_layers(hcell, cell_layers, nswe_flat, l_off, progress_cb=None):
                         out += struct.pack('<H', enc(z, n))
             elif flat_ok and len(hs) == 1:
                 out.append(0)
-                out += struct.pack('<h', cells[0][0][0])
+                out += struct.pack('<h', max(-16384, min(16376, cells[0][0][0])))
             else:
                 out.append(1)
                 for lay in cells:
@@ -688,7 +690,8 @@ def build_l2j_ray(hcell, hole_cell, fc, fc_grid, walls, w_grid, west, north,
                     lay = []
                     for z in ls:
                         nswe = 15
-                        wall_bits = 0                   # закрытые ТОЛЬКО стеной
+                        wall_bits = 0                   # закрытые стеной/декором
+                        block_bits = 0                  # закрытые BlockingVolume
                         for di, (bit, ngx, ngy, bkey) in enumerate((
                                 (8, gx, gy - 1, ('y', gx, gy)),
                                 (4, gx, gy + 1, ('y', gx, gy + 1)),
@@ -701,7 +704,7 @@ def build_l2j_ray(hcell, hole_cell, fc, fc_grid, walls, w_grid, west, north,
                             if bkey in blocked:          # BlockingVolume
                                 nswe &= ~bit
                                 if height_ok:
-                                    wall_bits |= bit
+                                    block_bits |= bit
                                 continue
                             if not height_ok:
                                 nswe &= ~bit             # перепад высот (склон/обрыв)
@@ -717,11 +720,18 @@ def build_l2j_ray(hcell, hole_cell, fc, fc_grid, walls, w_grid, west, north,
                             if is_wall:
                                 nswe &= ~bit
                                 wall_bits |= bit
-                        # anti-глухая: тонкий вертикальный объект (ствол/столб) не
-                        # запирает проходимую клетку со всех сторон — если заперли
-                        # ТОЛЬКО стены, возвращаем сторону обхода.
-                        if nswe == 0 and wall_bits:
-                            nswe = wall_bits
+                        # anti-глухая: тонкий объект (ствол/столб) не запирает
+                        # проходимую клетку со всех сторон — возвращаем сторону
+                        # обхода. НО сквозную преграду BlockingVolume (обе стороны
+                        # оси N-S=12 или W-E=3 закрыты объёмом) держим закрытой,
+                        # иначе заграждение «протекает» в узком проходе 1 ячейки.
+                        if nswe == 0 and (wall_bits or block_bits):
+                            give = wall_bits | block_bits
+                            if (block_bits & 12) == 12:   # сквозная ось N-S
+                                give &= ~12
+                            if (block_bits & 3) == 3:     # сквозная ось W-E
+                                give &= ~3
+                            nswe = give
                         lay.append((z, nswe))
                     cells.append(lay)
                     if len(lay) > 1:
@@ -737,7 +747,7 @@ def build_l2j_ray(hcell, hole_cell, fc, fc_grid, walls, w_grid, west, north,
                         out += struct.pack('<H', enc(z, n))
             elif flat_ok and len(hs) == 1:
                 out.append(0)
-                out += struct.pack('<h', cells[0][0][0])
+                out += struct.pack('<h', max(-16384, min(16376, cells[0][0][0])))
             else:
                 out.append(1)
                 for lay in cells:

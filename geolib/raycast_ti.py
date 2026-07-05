@@ -41,15 +41,19 @@ def init(prefer_gpu=True):
     ok = False
     if prefer_gpu:
         try:                                          # GPU только с f64
-            ti.init(arch=ti.gpu, default_fp=ti.f64, offline_cache=True,
-                    log_level=ti.ERROR)
+            # fast_math=False ОБЯЗАТЕЛЬНО: иначе бэкенд/LLVM вправе свернуть a*b+c
+            # в FMA и переассоциировать → расхождение на 1 ULP → флип граничных
+            # сравнений в лучах → другие байты. Детерминизм важнее микроскорости.
+            ti.init(arch=ti.gpu, default_fp=ti.f64, fast_math=False,
+                    offline_cache=True, log_level=ti.ERROR)
             # пробный f64-kernel: Metal упадёт здесь («f64 not supported»)
             _probe_f64(ti)
             ok = True
         except Exception:
             ok = False
     if not ok:                                        # CPU-бэкенд f64 (везде есть)
-        ti.init(arch=ti.cpu, default_fp=ti.f64, log_level=ti.ERROR)
+        ti.init(arch=ti.cpu, default_fp=ti.f64, fast_math=False,
+                log_level=ti.ERROR)
         _probe_f64(ti)
     _TI = ti
     _ARCH = str(ti.lang.impl.current_cfg().arch).rsplit('.', 1)[-1]
@@ -240,7 +244,7 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
         hz = dx * e2y - dy * e2x
         a = e1x * hx + e1y * hy + e1z * hz
         res = 0
-        if a > 1e-9 or a < -1e-9:
+        if a >= 1e-9 or a <= -1e-9:                  # == Python `not (-1e-9 < a < 1e-9)`
             f = 1.0 / a
             sx = px - ax
             sy = py - ay
@@ -272,7 +276,8 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
             for k in range(f_off[cell], f_off[cell + 1]):
                 z = f_z[k]
                 nswe = 15
-                wall_bits = 0
+                wall_bits = 0                            # стены/декор
+                block_bits = 0                           # BlockingVolume
                 for d in ti.static(range(4)):
                     bit = 8 >> d                        # N=8,S=4,W=2,E=1
                     ngx = gx + (0 if d < 2 else (-1 if d == 2 else 1))
@@ -298,7 +303,7 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
                         if blk == 1:
                             nswe &= ~bit
                             if hok == 1:
-                                wall_bits |= bit
+                                block_bits |= bit
                         elif hok == 0:
                             nswe &= ~bit
                         else:
@@ -339,8 +344,15 @@ def nswe_grid(cell_layers, hcell, walls, w_grid, blocked, west, north,
                             if h_lo == 1 and h_hi == 1:
                                 nswe &= ~bit
                                 wall_bits |= bit
-                if nswe == 0 and wall_bits != 0:         # anti-глухая
-                    nswe = wall_bits
+                # anti-глухая: возвращаем сторону обхода, но сквозную преграду
+                # BlockingVolume (ось N-S=12 или W-E=3) держим закрытой
+                if nswe == 0 and (wall_bits != 0 or block_bits != 0):
+                    give = wall_bits | block_bits
+                    if (block_bits & 12) == 12:
+                        give &= ~12
+                    if (block_bits & 3) == 3:
+                        give &= ~3
+                    nswe = give
                 o_nswe[k] = nswe
 
     nk(f_off, f_z, f_woff, f_wflat, f_walls, f_by, f_bx, o_nswe,
