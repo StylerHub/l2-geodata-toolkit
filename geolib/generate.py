@@ -51,18 +51,25 @@ def _find_file(directory, names):
     return None
 
 
-def map_path(maps_dir, region, variant='main'):
-    """Путь к карте региона: main → XX_YY.unr, classic → XX_YY_Classic.unr."""
-    name = f'{region}_Classic.unr' if variant == 'classic' else f'{region}.unr'
-    p = _find_file(maps_dir, [name])
+def map_path(maps_dir, map_name):
+    """Путь к карте по её имени в Maps как есть: XX_YY(.unr) или XX_YY_Classic."""
+    p = _find_file(maps_dir, [f'{map_name}.unr'])
     if not p:
-        raise GeoError(f'нет файла карты {name}')
+        raise GeoError(f'нет файла карты {map_name}.unr')
     return p
 
 
-def load_terrain(maps_dir, tex_dir, region, variant='main'):
+def _region_id(map_name):
+    """XX_YY (координаты в мире) из имени карты: '20_25_Classic' → '20_25'."""
+    import re
+    m = re.match(r'(\d+_\d+)', map_name)
+    return m.group(1) if m else map_name
+
+
+def load_terrain(maps_dir, tex_dir, map_name):
     """TerrainInfo + G16 → (heights[HM][HM] в мировых Z, holes set[(qx,qy)], loc)."""
-    unr = map_path(maps_dir, region, variant)
+    unr = map_path(maps_dir, map_name)
+    region = _region_id(map_name)
     pkg = Package(unr)
     tis = pkg.find_exports('TerrainInfo')
     if not tis:
@@ -227,14 +234,14 @@ def build_l2j(hcell, hole_cell, max_step=UP_STEP):
     return bytes(out)
 
 
-def generate_region(client_dir, region, max_step=UP_STEP, variant='main'):
-    """Клиент → l2j-байты региона (этап 1: только рельеф)."""
+def generate_region(client_dir, map_name, max_step=UP_STEP):
+    """Клиент → l2j-байты карты по её имени в Maps (этап 1: только рельеф)."""
     maps_dir = os.path.join(client_dir, 'Maps')
     tex_dir = os.path.join(client_dir, 'Textures')
     if not os.path.isdir(maps_dir):
         maps_dir = os.path.join(client_dir, 'MAPS')
-    heights, holes, loc = load_terrain(maps_dir, tex_dir, region, variant)
-    hcell, hole_cell = terrain_cells(region, heights, holes, loc)
+    heights, holes, loc = load_terrain(maps_dir, tex_dir, map_name)
+    hcell, hole_cell = terrain_cells(_region_id(map_name), heights, holes, loc)
     return build_l2j(hcell, hole_cell, max_step)
 
 
@@ -757,22 +764,23 @@ def build_l2j_ray(hcell, hole_cell, fc, fc_grid, walls, w_grid, west, north,
     return bytes(out)
 
 
-def generate_region_full(client_dir, region, max_step=UP_STEP, progress_cb=None,
-                         variant='main'):
-    """Клиент → l2j: рельеф + статик-меши и BSP-модель (полы/потолки в спаны) +
-    BlockingVolume (заградительные рёбра NSWE). Heightfield-ядро, NSWE по высоте."""
+def generate_region_full(client_dir, map_name, max_step=UP_STEP, progress_cb=None):
+    """Клиент → l2j по имени карты в Maps: рельеф + статик-меши и BSP-модель
+    (полы/потолки в спаны) + BlockingVolume (заградительные рёбра NSWE).
+    Heightfield-ядро, NSWE по высоте."""
     from .meshes import region_mesh_triangles
     maps_dir = os.path.join(client_dir, 'Maps')
     if not os.path.isdir(maps_dir):
         maps_dir = os.path.join(client_dir, 'MAPS')
     tex_dir = os.path.join(client_dir, 'Textures')
     usx_dir = os.path.join(client_dir, 'StaticMeshes')
-    heights, holes, loc = load_terrain(maps_dir, tex_dir, region, variant)
+    region = _region_id(map_name)
+    heights, holes, loc = load_terrain(maps_dir, tex_dir, map_name)
     hcell, hole_cell = terrain_cells(region, heights, holes, loc)
     rx, ry = map(int, region.split('_'))
     west, north = (rx - 20) * REGION_UNITS, (ry - 18) * REGION_UNITS
     from .unreal import Package
-    unr = map_path(maps_dir, region, variant)
+    unr = map_path(maps_dir, map_name)
     tris, skipped = region_mesh_triangles(unr, usx_dir)   # парсинг мешей (быстрый)
     from .meshes import level_extra_triangles
     solid, blocking = level_extra_triangles(Package(unr))
@@ -801,19 +809,18 @@ _PROGRESS_Q = None    # очередь тиков прогресса ворке�
 
 
 def _drain_progress(pq, active):
-    """Вычерпать все тики из очереди в active: (region,variant) → (done,total);
-    'done' удаляет регион из активных."""
+    """Вычерпать все тики из очереди в active: map_name → (done,total);
+    'done' удаляет карту из активных."""
     import queue as _q
     while True:
         try:
-            r, v, d = pq.get_nowait()[:3]
+            name, d = pq.get_nowait()[:2]
         except (_q.Empty, Exception):
             return
         if d == 'done':
-            active.pop((r, v), None)
+            active.pop(name, None)
         else:
-            # d — done-блоки; total лежит четвёртым элементом тика
-            active[(r, v)] = (d, 256)
+            active[name] = (d, 256)
 
 
 def _init_worker(q):
@@ -823,40 +830,39 @@ def _init_worker(q):
 
 
 def _worker(job):
-    """Один регион одного варианта (для пула процессов).
+    """Одна карта (для пула процессов).
 
     Атомарная запись: сперва во временный файл, валидация, затем
     os.replace → каноничный .l2j появляется только целым и проверенным.
     Прерывание (Ctrl+C/terminate) в момент записи оставит максимум .tmp,
     но никогда — обрезанный или невалидный .l2j.
-    Прогресс рейкаста шлётся в _PROGRESS_Q тиками (region, variant, done, total),
-    завершение — (region, variant, 'done')."""
-    client_dir, region, variant, out_path, max_step, terrain_only = job
+    Прогресс рейкаста шлётся в _PROGRESS_Q тиками (map_name, done, total),
+    завершение — (map_name, 'done')."""
+    client_dir, map_name, out_path, max_step, terrain_only = job
     tmp = out_path + '.tmp'
     q = _PROGRESS_Q
-    cb = (lambda d, t: q.put((region, variant, d, t))) if q is not None else None
+    cb = (lambda d, t: q.put((map_name, d, t))) if q is not None else None
     try:
         if terrain_only:
-            data = generate_region(client_dir, region, max_step, variant)
+            data = generate_region(client_dir, map_name, max_step)
         else:
-            data, _n, _s = generate_region_full(client_dir, region, max_step,
-                                                cb, variant)
+            data, _n, _s = generate_region_full(client_dir, map_name, max_step, cb)
         with open(tmp, 'wb') as f:
             f.write(data)
         from .convert import validate_l2j
         validate_l2j(tmp)
         os.replace(tmp, out_path)                 # атомарная подмена
         if q is not None:
-            q.put((region, variant, 'done'))
-        return (region, variant, None)
+            q.put((map_name, 'done'))
+        return (map_name, None)
     except BaseException as e:                     # incl. KeyboardInterrupt/SystemExit
         if os.path.exists(tmp):
             os.remove(tmp)
         if q is not None:
-            q.put((region, variant, 'done'))
+            q.put((map_name, 'done'))
         if isinstance(e, (KeyboardInterrupt, SystemExit)):
             raise
-        return (region, variant, f'{type(e).__name__}: {e}')
+        return (map_name, f'{type(e).__name__}: {e}')
 
 
 
@@ -901,14 +907,13 @@ def _auto_jobs():
     return half_cores
 
 
-def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
+def cmd_generate(client_dir, out_dir, maps=None, max_step=UP_STEP,
                  terrain_only=False, jobs=None):
-    """Генерация из клиента: оба варианта карт по папкам out/main и out/classic.
+    """Генерация из клиента: каждая карта Maps как есть → out/<имя>.l2j.
 
-    main/XX_YY.l2j — из XX_YY.unr (все регионы);
-    classic/XX_YY.l2j — из XX_YY_Classic.unr (только переработанные зоны;
-    для классик-сервера поверх main кладутся файлы из classic)."""
-    import glob as _g
+    Имя квадрата = имя файла карты: XX_YY (из XX_YY.unr) и XX_YY_Classic
+    (из XX_YY_Classic.unr) — отдельные квадраты. Генерится ровно выбранное;
+    maps — список имён (None → все карты вида XX_YY*.unr)."""
     import multiprocessing as mp
     import re as _re
     import time as _t
@@ -920,28 +925,21 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
         print(red(f'  ✗ не найдена папка Maps в {client_dir}'))
         return 1
     listing = os.listdir(maps_dir)
-    mains = sorted(m.group(1) for f in listing
-                   for m in [_re.match(r'^(\d+_\d+)\.unr$', f, _re.IGNORECASE)] if m)
-    classics = sorted(m.group(1) for f in listing
-                      for m in [_re.match(r'^(\d+_\d+)_classic\.unr$', f, _re.IGNORECASE)] if m)
-    if regions:
-        mains = [r for r in mains if r in regions]
-        classics = [r for r in classics if r in regions]
-    tasks = ([(client_dir, r, 'main', os.path.join(out_dir, 'main', r + '.l2j'),
-               max_step, terrain_only) for r in mains] +
-             [(client_dir, r, 'classic', os.path.join(out_dir, 'classic', r + '.l2j'),
-               max_step, terrain_only) for r in classics])
+    all_maps = sorted(m.group(1) for f in listing
+                      for m in [_re.match(r'^(\d+_\d+.*?)\.unr$', f, _re.IGNORECASE)] if m)
+    names = [n for n in all_maps if n in maps] if maps else all_maps
+    tasks = [(client_dir, n, os.path.join(out_dir, n + '.l2j'), max_step, terrain_only)
+             for n in names]
     if not tasks:
-        print(red('  ✗ нет карт вида XX_YY.unr'))
+        print(red('  ✗ нет подходящих карт (XX_YY*.unr) в Maps'))
         return 1
-    os.makedirs(os.path.join(out_dir, 'main'), exist_ok=True)
-    if classics:
-        os.makedirs(os.path.join(out_dir, 'classic'), exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    label_w = max((len(n) for n in names), default=8) + 2   # выравнивание баров
     nproc = jobs or _auto_jobs()
     ram = _total_ram_gb()
     how = 'задано -j' if jobs else (f'авто: половина ресурсов'
           + (f' от {ram:.0f} ГБ ОЗУ / {os.cpu_count() or "?"} потоков' if ram else ''))
-    print(f'  {bold("Генерация")}: main {len(mains)} + classic {len(classics)}'
+    print(f'  {bold("Генерация")}: {len(names)} карт'
           f' → {out_dir} · {nproc} процессов ({how})'
           f'{" · только рельеф" if terrain_only else ""}\n')
     print(dim('  (Ctrl+C — прервать; готовые файлы сохранятся)\n'))
@@ -950,20 +948,21 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
     total = len(tasks)
     aborted = False
     if total <= 3:
-        # мало квадратов → последовательно, с прогрессом-ETA ВНУТРИ региона (по
+        # мало квадратов → последовательно, с прогрессом-ETA ВНУТРИ карты (по
         # блокам): видно, сколько осталось до конца квадрата, а не только 0→100%.
         from .convert import validate_l2j
         try:
-            for i, (cl, region, variant, out_path, ms, terr) in enumerate(tasks, 1):
-                def cb(d, t, _r=region, _v=variant):
-                    progress(d, t, f'  {_r} [{_v}] ')
+            for i, (cl, name, out_path, ms, terr) in enumerate(tasks, 1):
+                def cb(d, t, _n=name):
+                    # метка фикс. ширины → бары строго друг под другом
+                    progress(d, t, f'  {_n}'.ljust(label_w) + ' ')
                 tmp = out_path + '.tmp'
                 try:
                     if terr:
-                        data = generate_region(cl, region, ms, variant)
+                        data = generate_region(cl, name, ms)
                         cb(256, 256)
                     else:
-                        data, _n, _s = generate_region_full(cl, region, ms, cb, variant)
+                        data, _n, _s = generate_region_full(cl, name, ms, cb)
                     with open(tmp, 'wb') as f:
                         f.write(data)
                     validate_l2j(tmp)
@@ -976,7 +975,7 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
                 except BaseException as e:
                     if os.path.exists(tmp):
                         os.remove(tmp)
-                    errors.append((f'{region}/{variant}', f'{type(e).__name__}: {e}'))
+                    errors.append((name, f'{type(e).__name__}: {e}'))
                 done = i
         except KeyboardInterrupt:
             aborted = True
@@ -996,14 +995,13 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
         pool = mp.Pool(nproc, _init_worker, (pq,))
         signal.signal(signal.SIGINT, orig)
         asyncs = [pool.apply_async(_worker, (job,)) for job in tasks]
-        active = {}                                  # (region, variant) → (done, total)
-        results_seen = [False] * total
+        active = {}                                  # map_name → (done, total)
         t0b = _tt.monotonic()
         try:
             while True:
                 _drain_progress(pq, active)          # вычерпать тики прогресса
                 completed = sum(1 for a in asyncs if a.ready())
-                # отрисовка: общий бар + активные регионы
+                # отрисовка: общий бар + активные карты
                 w = 24
                 frac = completed / total if total else 1.0
                 bar = '█' * int(w * frac) + '░' * (w - int(w * frac))
@@ -1011,8 +1009,8 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
                 eta = ('~' + fmt_dur(el / completed * (total - completed))
                        if completed and el > 1 else '')
                 act = ' · '.join(
-                    f'{r} {min(99, d * 100 // t)}%'
-                    for (r, v), (d, t) in sorted(active.items())[:5] if t)
+                    f'{n} {min(99, d * 100 // t)}%'
+                    for n, (d, t) in sorted(active.items())[:5] if t)
                 line = (f'\r  генерация {_cyan(bar)} {frac:5.1%} ({completed}/{total})'
                         f' {eta}' + (f'  │ {act}' if act else ''))
                 sys.stdout.write(line[:220] + ' ' * 6)
@@ -1022,12 +1020,12 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
                 _tt.sleep(0.25)
             sys.stdout.write('\n')
             for a in asyncs:
-                region, variant, err = a.get()
+                name, err = a.get()
                 done += 1
                 if err is None:
                     ok += 1
                 else:
-                    errors.append((f'{region}/{variant}', err))
+                    errors.append((name, err))
         except KeyboardInterrupt:
             aborted = True
             pool.terminate()
@@ -1038,12 +1036,11 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
             pool.join()
             # подчистить .tmp-огрызки прерванных записей (SIGTERM мог убить до уборки)
             import glob as _g2
-            for sub in ('main', 'classic'):
-                for t in _g2.glob(os.path.join(out_dir, sub, '*.l2j.tmp')):
-                    try:
-                        os.remove(t)
-                    except OSError:
-                        pass
+            for t in _g2.glob(os.path.join(out_dir, '*.l2j.tmp')):
+                try:
+                    os.remove(t)
+                except OSError:
+                    pass
     if aborted:
         return 130
     print(f'\n  {bold("Итог")} за {(_t.time() - t0) / 60:.1f} мин:'
@@ -1051,20 +1048,17 @@ def cmd_generate(client_dir, out_dir, regions=None, max_step=UP_STEP,
     for name, why in errors[:10]:
         print(f'    {red("✗")} {name}: {why}')
     if errors:
-        print(dim('    (пропущены регионы без heightmap в клиенте — там нечего'
-                  ' генерировать; на классик-сервере такой квадрат берётся из main/)'))
+        print(dim('    (пропущены карты без heightmap в клиенте — там нечего'
+                  ' генерировать)'))
     if not terrain_only:
-        main_dir = os.path.join(out_dir, 'main')
         print(f'\n  {bold("Что дальше:")}')
-        print(f'    • {out_dir}/{bold("main")}/ — геодата всего мира. Для обычного'
-              ' (не classic) сервера бери её целиком.')
-        if classics:
-            print(f'    • {out_dir}/{bold("classic")}/ — {len(classics)} переработанных'
-                  ' для Classic зон. Для classic-сервера: возьми main/ и скопируй'
-                  ' classic/ поверх (замещает эти квадраты).')
+        print(f'    • {out_dir}/ — по файлу <имя>.l2j на карту. Имя = имя карты'
+              ' в Maps (XX_YY и XX_YY_Classic — отдельные файлы).')
+        print(dim('      Для classic-сервера квадрат из XX_YY_Classic.l2j кладётся'
+                  ' под именем XX_YY.l2j (заменяет базовый).'))
         print(f'\n  {yellow("Проверь перед установкой:")}')
-        print(f'    geotool.py view {main_dir}   — глянуть карту/города/слои в браузере')
-        print('    geotool.py diff <твоя_геодата> ' + main_dir
+        print(f'    geotool.py view {out_dir}   — глянуть карту/города/слои в браузере')
+        print('    geotool.py diff <твоя_геодата> ' + out_dir
               + '   — сравнить с текущей (высоты и проходимость)')
         print(dim('    …и обязательно пройди ключевые зоны в игре — генерация'
                   ' не проверяет их сама.'))

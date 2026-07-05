@@ -34,33 +34,31 @@ def ask(prompt, default=None):
 
 
 def _scan_regions(client_dir):
+    """Все карты Maps как имена файлов: XX_YY и XX_YY_Classic — отдельные квадраты."""
     import re as _re
     maps_dir = os.path.join(client_dir, 'Maps')
     if not os.path.isdir(maps_dir):
         maps_dir = os.path.join(client_dir, 'MAPS')
     if not os.path.isdir(maps_dir):
-        return [], set()
+        return []
     listing = os.listdir(maps_dir)
-    mains = sorted(m.group(1) for f in listing
-                   for m in [_re.match(r'^(\d+_\d+)\.unr$', f, _re.IGNORECASE)] if m)
-    classics = {m.group(1) for f in listing
-                for m in [_re.match(r'^(\d+_\d+)_classic\.unr$', f, _re.IGNORECASE)] if m}
-    return mains, classics
+    return sorted(m.group(1) for f in listing
+                  for m in [_re.match(r'^(\d+_\d+.*?)\.unr$', f, _re.IGNORECASE)] if m)
 
 
-def _pick_regions_tui(mains, classics):
+def _pick_regions_tui(maps):
     """Интерактивный выбор: стрелки — навигация, Enter/Space — выделить/снять,
     A — все, N — ничего, G — генерировать, Q — отмена."""
     import curses
 
-    COLS = 6
+    COLS = 5
 
     def run(scr):
         curses.curs_set(0)
         scr.keypad(True)
         sel = set()
         cur = 0
-        n = len(mains)
+        n = len(maps)
         rows = (n + COLS - 1) // COLS
         top = 0                                    # первая видимая строка сетки
         while True:
@@ -75,7 +73,7 @@ def _pick_regions_tui(mains, classics):
             scr.addnstr(0, 0, f'Квадраты клиента: {n} · выбрано: {len(sel)}'
                         f'{" (Enter по G — все)" if not sel else ""}', w - 1,
                         curses.A_BOLD)
-            if w < COLS * 13 + 1 or h < 6:        # окно не вмещает сетку → текст. фолбэк
+            if w < COLS * 18 + 1 or h < 6:        # окно не вмещает сетку → текст. фолбэк
                 return 'SMALL'
             for r in range(top, min(rows, top + vis_rows)):
                 y = 1 + r - top
@@ -83,11 +81,10 @@ def _pick_regions_tui(mains, classics):
                     i = r * COLS + c
                     if i >= n:
                         break
-                    reg = mains[i]
-                    mark = 'c' if reg in classics else ' '
+                    reg = maps[i]
                     box = '■' if i in sel else '·'
                     attr = curses.A_REVERSE if i == cur else curses.A_NORMAL
-                    scr.addnstr(y, c * 13, f'{box} {reg}{mark}', min(12, w - 1 - c * 13), attr)
+                    scr.addnstr(y, c * 18, f'{box} {reg}', min(17, w - 1 - c * 18), attr)
             scr.addnstr(h - 2, 0, '─' * min(78, w - 1), w - 1)
             scr.addnstr(h - 1, 0,
                         '←↑↓→ навигация · Enter/Space — выделить/снять · '
@@ -109,7 +106,7 @@ def _pick_regions_tui(mains, classics):
             elif key in (ord('n'), ord('N'), ord('т'), ord('Т')):
                 sel = set()
             elif key in (ord('g'), ord('G'), ord('п'), ord('П')):
-                return sorted(mains[i] for i in sel) if sel else None
+                return sorted(maps[i] for i in sel) if sel else None
             elif key in (27, ord('q'), ord('Q'), ord('й'), ord('Й')):
                 return 'CANCEL'
     return curses.wrapper(run)
@@ -119,26 +116,25 @@ def _pick_regions(client_dir):
     """Выбор квадратов: TUI со стрелками; фолбэк — текстовый ввод
     (номера/диапазоны/имена), если curses недоступен (Windows) или не TTY."""
     import re as _re
-    mains, classics = _scan_regions(client_dir)
-    if not mains:
+    maps = _scan_regions(client_dir)
+    if not maps:
         return None
     if sys.stdin.isatty() and sys.stdout.isatty():
         try:
             import curses  # noqa: F401 — на Windows отсутствует
-            res = _pick_regions_tui(mains, classics)
+            res = _pick_regions_tui(maps)
             if res != 'SMALL':                     # SMALL — окно мало, ниже текст. ввод
                 return res
         except ImportError:
             pass
         except Exception:
             pass                                   # кривой TERM и т.п. — фолбэк
-    print(f'\n  Квадраты клиента ({len(mains)}; ●c — есть Classic-вариант):')
-    per_row = 6
-    for i in range(0, len(mains), per_row):
+    print(f'\n  Квадраты клиента ({len(maps)}; XX_YY_Classic — отдельный квадрат):')
+    per_row = 5
+    for i in range(0, len(maps), per_row):
         row = ''
-        for j, r in enumerate(mains[i:i + per_row], i + 1):
-            mark = '●c' if r in classics else '  '
-            row += f'{j:4d}) {r}{mark} '
+        for j, r in enumerate(maps[i:i + per_row], i + 1):
+            row += f'{j:4d}) {r:<15} '
         print('  ' + row)
     raw = input('\n  Выбор (Enter — все, номера/диапазоны/имена): ').strip()
     if not raw:
@@ -149,12 +145,12 @@ def _pick_regions(client_dir):
         if m:
             a, b = int(m.group(1)), int(m.group(2))
             for k in range(min(a, b), max(a, b) + 1):
-                if 1 <= k <= len(mains):
-                    chosen.append(mains[k - 1])
-        elif _re.match(r'^\d+_\d+$', tok):
+                if 1 <= k <= len(maps):
+                    chosen.append(maps[k - 1])
+        elif _re.match(r'^\d+_\d+', tok):          # имя карты (в т.ч. с _Classic)
             chosen.append(tok)
-        elif tok.isdigit() and 1 <= int(tok) <= len(mains):
-            chosen.append(mains[int(tok) - 1])
+        elif tok.isdigit() and 1 <= int(tok) <= len(maps):
+            chosen.append(maps[int(tok) - 1])
         else:
             print(f'  ⚠ не понял «{tok}» — пропускаю')
     chosen = sorted(set(chosen))
