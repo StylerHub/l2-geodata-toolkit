@@ -852,9 +852,25 @@ def _drain_progress(pq, active):
 
 
 def _init_worker(q):
-    """Инициализатор процесса пула: запоминает очередь прогресса."""
+    """Инициализатор процесса пула: запоминает очередь прогресса и ГЛУШИТ
+    stdout/stderr воркера на весь его срок жизни.
+
+    Зачем: Taichi при инициализации печатает баннер («[Taichi] version …»,
+    «Starting on arch=cuda») напрямую в консоль, в обход sys.stdout и log_level.
+    В пуле это врезается в \\r-прогрессбар главного процесса, и кажется, что
+    прогресс печатается заново. Воркеру консоль не нужна: прогресс идёт через
+    очередь q, ошибки возвращаются кортежом из _worker. Перенаправление ДОЛЖНО
+    быть постоянным (не временным): Taichi сбрасывает баннер отложенно, и при
+    восстановлении fd он бы всё равно прорвался."""
     global _PROGRESS_Q
     _PROGRESS_Q = q
+    try:
+        dn = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(dn, 1)                                # stdout → devnull
+        os.dup2(dn, 2)                                # stderr → devnull
+        os.close(dn)
+    except Exception:
+        pass                                          # не вышло — не критично
 
 
 def _worker(job):
@@ -892,6 +908,31 @@ def _worker(job):
             raise
         return (map_name, f'{type(e).__name__}: {e}')
 
+
+
+def _taichi_available():
+    """Установлен ли Taichi — для строки-статуса в параллельном пути. Через
+    find_spec, БЕЗ импорта: сам import taichi печатает версию-баннер, а в главном
+    процессе он тут не нужен (init и его баннер — дело воркеров, у них заглушено)."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec('taichi') is not None
+    except Exception:
+        return False
+
+
+def _prewarm_taichi():
+    """Инициализировать Taichi в ТЕКУЩЕМ процессе заранее (последовательный путь):
+    стартовый баннер печатается один раз ДО прогресс-баров, а не врезается в них,
+    и первая карта не платит за init на ходу. Возвращает имя бэкенда
+    ('cuda'/'cpu'/…) или None (Taichi нет/сбой)."""
+    try:
+        from . import raycast_ti as RT
+        if RT.available():
+            return RT.init()
+    except Exception:
+        pass
+    return None
 
 
 WORKER_RAM_GB = 2.5    # оценка пиковой памяти воркера на городском регионе
@@ -971,9 +1012,20 @@ def cmd_generate(client_dir, out_dir, maps=None, max_step=UP_STEP,
           f' → {out_dir} · {nproc} процессов ({how})'
           f'{" · только рельеф" if terrain_only else ""}\n')
     print(dim('  (Ctrl+C — прервать; готовые файлы сохранятся)\n'))
+    total = len(tasks)
+    # строка-статус ускорителя. В последовательном пути (≤3) рейкаст идёт в этом
+    # же процессе — прогреваем Taichi заранее, чтобы его баннер лёг сверху, а не
+    # врезался в бары. В пуле воркеры инициализируют его сами и молча (их вывод
+    # заглушён в _init_worker), поэтому здесь только проверяем наличие.
+    if total <= 3:
+        _arch = _prewarm_taichi()
+        _acc = f'Taichi arch={_arch}' if _arch else 'нет (чистый Python, CPU)'
+    else:
+        _acc = 'Taichi (GPU/CPU в воркерах)' if _taichi_available() \
+            else 'нет (чистый Python, CPU)'
+    print(dim(f'  Ускоритель: {_acc}\n'))
     t0 = _t.time()
     ok, errors, done = 0, [], 0
-    total = len(tasks)
     aborted = False
     if total <= 3:
         # мало квадратов → последовательно, с прогрессом-ETA ВНУТРИ карты (по

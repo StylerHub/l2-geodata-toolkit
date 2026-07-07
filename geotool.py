@@ -33,6 +33,42 @@ def ask(prompt, default=None):
     return os.path.expanduser(s) if s else default
 
 
+def _ensure_taichi(interactive_ok=True):
+    """Проверить наличие Taichi — опционального ускорителя рейкаста (GPU на
+    NVIDIA/CUDA, иначе многопоточный CPU). Его отсутствие НЕ ошибка: генерация
+    идёт на чистом Python с тем же результатом байт-в-байт, лишь медленнее.
+    Если Taichi нет — подсказать и в интерактивном TTY предложить установку."""
+    try:
+        import taichi  # noqa: F401
+        return
+    except Exception:
+        pass
+    print(dim('\n  Taichi не установлен — генерация пойдёт на чистом Python (CPU).'))
+    print(dim('  Ускоритель Taichi считает тот же результат байт-в-байт, но быстрее'))
+    print(dim('  (GPU на NVIDIA/CUDA с поддержкой f64, иначе нативный многопоточный CPU).'))
+    if not (interactive_ok and sys.stdin.isatty() and sys.stdout.isatty()):
+        print(dim('  Установка: pip install taichi\n'))
+        return
+    ans = input('  Установить сейчас (pip install taichi)? [y/N]: ').strip().lower()
+    if ans not in ('y', 'yes', 'д', 'да'):
+        print(dim('  Пропускаю. Позже вручную: pip install taichi\n'))
+        return
+    import subprocess
+    print(dim('  Устанавливаю taichi …'))
+    try:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'taichi'])
+    except Exception as e:
+        print(f'  ⚠ установка не удалась: {e}')
+        print(dim('  Продолжаю на чистом Python. Позже вручную: pip install taichi\n'))
+        return
+    try:
+        import taichi  # noqa: F401  — проверяем, что импортируется в этом процессе
+        print(dim('  Taichi установлен — ускоритель будет задействован.\n'))
+    except Exception:
+        print(dim('  Установлено, но не импортируется в текущем процессе —'
+                  ' перезапустите geotool, чтобы задействовать.\n'))
+
+
 def _scan_regions(client_dir):
     """Все карты Maps как имена файлов: XX_YY и XX_YY_Classic — отдельные квадраты."""
     import re as _re
@@ -225,6 +261,7 @@ def interactive():
             if regions == 'CANCEL':
                 print('  отменено.')
                 continue
+            _ensure_taichi()
             cmd_generate(c, out, regions)
         elif ch == '0' or ch == '':
             return 0
@@ -256,6 +293,7 @@ def main():
     if args.cmd == 'diff':
         return cmd_diff(x(args.dir_a), x(args.dir_b), args.region)
     if args.cmd == 'generate':
+        _ensure_taichi(interactive_ok=False)
         return cmd_generate(x(args.client), x(args.out), args.region,
                             args.max_step, args.terrain_only, args.jobs)
     if args.cmd == 'check':
