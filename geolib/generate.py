@@ -1015,7 +1015,6 @@ def cmd_generate(client_dir, out_dir, maps=None, max_step=UP_STEP,
         print(red('  ✗ нет подходящих карт (XX_YY*.unr) в Maps'))
         return 1
     os.makedirs(out_dir, exist_ok=True)
-    label_w = max((len(n) for n in names), default=8) + 2   # выравнивание баров
     nproc = jobs or _auto_jobs()
     ram = _total_ram_gb()
     how = 'задано -j' if jobs else (f'авто: половина ресурсов'
@@ -1046,8 +1045,7 @@ def cmd_generate(client_dir, out_dir, maps=None, max_step=UP_STEP,
         try:
             for i, (cl, name, out_path, ms, terr) in enumerate(tasks, 1):
                 def cb(d, t, _n=name):
-                    # метка фикс. ширины → бары строго друг под другом
-                    progress(d, t, f'  {_n}'.ljust(label_w) + ' ')
+                    progress(d, t, _n)               # bar_line выровняет подпись
                 tmp = out_path + '.tmp'
                 try:
                     if terr:
@@ -1069,6 +1067,8 @@ def cmd_generate(client_dir, out_dir, maps=None, max_step=UP_STEP,
                         os.remove(tmp)
                     errors.append((name, f'{type(e).__name__}: {e}'))
                 done = i
+                if i < total:
+                    print()                          # межстрочный интервал между барами
         except KeyboardInterrupt:
             aborted = True
             print(dim(f'\n  прервано на {done}/{total} — готовые {ok} сохранены.'))
@@ -1080,7 +1080,7 @@ def cmd_generate(client_dir, out_dir, maps=None, max_step=UP_STEP,
         import signal
         import time as _tt
         import queue as _queue
-        from .ui import fmt_dur, cyan as _cyan
+        from .ui import fmt_dur, bar_line, LiveBlock, term_height
         mgr = mp.Manager()
         pq = mgr.Queue()
         orig = signal.signal(signal.SIGINT, signal.SIG_IGN)
@@ -1089,27 +1089,35 @@ def cmd_generate(client_dir, out_dir, maps=None, max_step=UP_STEP,
         asyncs = [pool.apply_async(_worker, (job,)) for job in tasks]
         active = {}                                  # map_name → (done, total)
         t0b = _tt.monotonic()
+        live = LiveBlock()                           # шапка + по строке на воркер
         try:
             while True:
                 _drain_progress(pq, active)          # вычерпать тики прогресса
                 completed = sum(1 for a in asyncs if a.ready())
-                # отрисовка: общий бар + активные карты
-                w = 24
-                frac = completed / total if total else 1.0
-                bar = '█' * int(w * frac) + '░' * (w - int(w * frac))
                 el = _tt.monotonic() - t0b
-                eta = ('~' + fmt_dur(el / completed * (total - completed))
+                eta = ('  ~' + fmt_dur(el / completed * (total - completed))
                        if completed and el > 1 else '')
-                act = ' · '.join(
-                    f'{n} {min(99, d * 100 // t)}%'
-                    for n, (d, t) in sorted(active.items())[:5] if t)
-                line = (f'\r  генерация {_cyan(bar)} {frac:5.1%} ({completed}/{total})'
-                        f' {eta}' + (f'  │ {act}' if act else ''))
-                sys.stdout.write(line[:220] + ' ' * 6)
-                sys.stdout.flush()
+                # шапка = общий прогресс; ниже — по бару на каждый активный
+                # воркер в едином формате, разделённые пустой строкой.
+                head = bar_line('генерация', completed, total, eta)
+                lines = [head]
+                shown = [(n, d, t) for n, (d, t) in sorted(active.items()) if t]
+                # не выше терминала: каждый бар = 2 строки (пустая + бар), одну
+                # строку резервируем под «…ещё N». Иначе высокий блок при
+                # перерисовке упрётся курсором в верх экрана и «поедет».
+                room = max(1, (term_height() - 3) // 2)
+                for n, d, t in shown[:room]:
+                    lines.append('')                 # межстрочный интервал
+                    lines.append(bar_line(n, d, t))
+                if len(shown) > room:
+                    lines.append(f'    …ещё {len(shown) - room} в работе')
+                live.render(lines)
                 if completed >= total:
+                    active.clear()                   # финальный кадр — только шапка
+                    live.render([head])
                     break
                 _tt.sleep(0.25)
+            live.stop()
             sys.stdout.write('\n')
             for a in asyncs:
                 name, err = a.get()
