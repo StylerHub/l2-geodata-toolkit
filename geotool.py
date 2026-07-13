@@ -22,7 +22,7 @@ import argparse
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from geolib import cmd_check, cmd_convert, cmd_diff, cmd_generate, cmd_l2j2pts, cmd_verify, cmd_view
 from geolib.ui import BANNER, bold, cyan, dim
