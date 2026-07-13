@@ -89,19 +89,12 @@ def cmd_convert(paths, out_dir, assume_yes=False):
             files.append(p)
         else:
             print(red(f'  ✗ не найдено: {p}'))
-    jobs, skipped = {}, []
+    # имя сохраняется: 27_24_Classic_conv.dat → 27_24_Classic.l2j
+    jobs = {}
     for f in files:
-        m = re.match(r'^(\d+_\d+)_conv\.dat$', os.path.basename(f))
-        if m:
-            jobs[m.group(1) + '.l2j'] = f
-        else:
-            skipped.append(f)
-    if skipped:
-        print(yellow(f'  ⚠ ПРОПУЩЕНО {len(skipped)} файлов — имя не канон XX_YY_conv.dat:'))
-        for f in skipped[:20]:
-            print(yellow(f'      {os.path.basename(f)}'))
-        if len(skipped) > 20:
-            print(yellow(f'      … и ещё {len(skipped) - 20}'))
+        base = os.path.basename(f)
+        stem = base[:-len('_conv.dat')] if base.endswith('_conv.dat') else os.path.splitext(base)[0]
+        jobs[stem + '.l2j'] = f
     if not jobs:
         print(red('  ✗ нечего конвертировать.'))
         return 1
@@ -122,7 +115,10 @@ def cmd_convert(paths, out_dir, assume_yes=False):
                 totals[j] += st[j]
         except GeoError as e:
             errors.append((name, str(e)))
-            if os.path.exists(dst):
+            # dst может совпадать с исходником (перепутанное направление
+            # конвертации + вывод в ту же папку) — исходник не трогаем
+            if os.path.exists(dst) and \
+                    os.path.realpath(dst) != os.path.realpath(jobs[name]):
                 os.remove(dst)
         progress(i, len(names), 'конвертация ')
     print(f'\n  {bold("Итог")} за {time.time() - t0:.1f} с:')
@@ -133,11 +129,7 @@ def cmd_convert(paths, out_dir, assume_yes=False):
         print(f'    {red("✗")} ошибки: {red(str(len(errors)))}')
         for name, why in errors[:10]:
             print(f'      {red("✗")} {name}: {why}')
-    if skipped:
-        print(yellow(f'    ⚠ пропущено из-за имени: {len(skipped)} (см. выше)'))
-    if errors:
-        return 2
-    return 3 if skipped else 0
+    return 2 if errors else 0
 
 
 def l2j2pts_file(src, dst, rx, ry):
@@ -206,15 +198,21 @@ def cmd_l2j2pts(paths, out_dir, assume_yes=False):
             files.append(p)
         else:
             print(red(f'  ✗ не найдено: {p}'))
+    # имя сохраняется: 27_24_Classic.l2j → 27_24_Classic_conv.dat;
+    # координаты региона (заголовок PTS) — из первых двух чисел имени
     jobs, skipped = {}, []
     for f in files:
-        m = re.match(r'^(\d+)_(\d+)\.l2j$', os.path.basename(f))
-        if m:
-            jobs[f'{m.group(1)}_{m.group(2)}_conv.dat'] = (f, int(m.group(1)), int(m.group(2)))
-        else:
+        base = os.path.basename(f)
+        m = re.match(r'^(\d+)_(\d+)', base)
+        # заголовок PTS кодирует координаты как u8 — числа >255 не координаты
+        if not m or int(m.group(1)) > 255 or int(m.group(2)) > 255:
             skipped.append(f)
+            continue
+        stem = base[:-len('.l2j')] if base.endswith('.l2j') else os.path.splitext(base)[0]
+        jobs[stem + '_conv.dat'] = (f, int(m.group(1)), int(m.group(2)))
     if skipped:
-        print(yellow(f'  ⚠ ПРОПУЩЕНО {len(skipped)} файлов — имя не канон XX_YY.l2j:'))
+        print(yellow(f'  ⚠ ПРОПУЩЕНО {len(skipped)} файлов — имя не начинается с XX_YY,'
+                     f' координаты региона не извлечь:'))
         for f in skipped[:20]:
             print(yellow(f'      {os.path.basename(f)}'))
     if not jobs:

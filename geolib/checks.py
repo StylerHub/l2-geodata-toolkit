@@ -4,7 +4,6 @@
 
 import glob
 import os
-import re
 import struct
 
 from .formats import BLOCKS, GeoError, block_type, parse_region
@@ -65,16 +64,15 @@ def cmd_verify(pts_dir, l2j_dir):
     if not _g.glob(os.path.join(pts_dir, '*_conv.dat')) and \
             _g.glob(os.path.join(l2j_dir, '*_conv.dat')):
         pts_dir, l2j_dir = l2j_dir, pts_dir
-    # Канон PTS: строго XX_YY_conv.dat ↔ XX_YY.l2j, один к одному.
+    # Пары по имени: X_conv.dat ↔ X.l2j (конвертация сохраняет имя,
+    # 27_24_Classic_conv.dat ↔ 27_24_Classic.l2j).
     pairs = []
     unpaired = 0
     for f in sorted(glob.glob(os.path.join(pts_dir, '*_conv.dat'))):
-        m = re.match(r'^(\d+_\d+)_conv\.dat$', os.path.basename(f))
-        if not m:
-            continue
-        dst = os.path.join(l2j_dir, m.group(1) + '.l2j')
+        stem = os.path.basename(f)[:-len('_conv.dat')]
+        dst = os.path.join(l2j_dir, stem + '.l2j')
         if os.path.exists(dst):
-            pairs.append((m.group(1), f, dst))
+            pairs.append((stem, f, dst))
         else:
             unpaired += 1
     if unpaired:

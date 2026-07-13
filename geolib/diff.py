@@ -17,13 +17,17 @@ FAR = 64               # |Δh| > FAR — «другой рельеф»
 
 
 def region_files(d):
-    """Канонические файлы папки: имя региона → путь (.l2j приоритетнее)."""
+    """Файлы папки: стем имени → путь (.l2j приоритетнее _conv.dat).
+    Стем сохраняет суффикс: 27_24_Classic — отдельный регион от 27_24;
+    координаты должны извлекаться из первых двух чисел имени."""
     out = {}
     for f in sorted(glob.glob(os.path.join(d, '*.l2j'))) + \
              sorted(glob.glob(os.path.join(d, '*_conv.dat'))):
-        m = re.match(r'^(\d+_\d+)(\.l2j|_conv\.dat)$', os.path.basename(f))
-        if m:
-            out.setdefault(m.group(1), f)
+        base = os.path.basename(f)
+        if not re.match(r'^\d+_\d+', base):
+            continue
+        stem = base[:-len('_conv.dat')] if base.endswith('_conv.dat') else base[:-len('.l2j')]
+        out.setdefault(stem, f)
     return out
 
 
@@ -90,7 +94,7 @@ def sampled_surface(path, wanted):
 
 
 def _world(region, bx, by):
-    rx, ry = map(int, region.split('_'))
+    rx, ry = map(int, re.match(r'^(\d+)_(\d+)', region).groups())
     return (rx - 20) * 32768 + bx * 128, (ry - 18) * 32768 + by * 128
 
 
@@ -178,7 +182,7 @@ def _detail(region, fa, fb, name_a, name_b):
 def cmd_diff(dir_a, dir_b, region=None):
     fa_all, fb_all = region_files(dir_a), region_files(dir_b)
     if not fa_all or not fb_all:
-        print(red('  ✗ в одной из папок нет файлов геодаты (канон XX_YY.l2j / XX_YY_conv.dat).'))
+        print(red('  ✗ в одной из папок нет файлов геодаты (*.l2j / *_conv.dat с именем от XX_YY).'))
         return 1
     name_a, name_b = (os.path.basename(os.path.normpath(d)) for d in (dir_a, dir_b))
     common = sorted(set(fa_all) & set(fb_all))
@@ -249,5 +253,5 @@ def cmd_diff(dir_a, dir_b, region=None):
     if only_b:
         print(f'  только в B ({name_b}): {len(only_b)} — {" ".join(only_b[:12])}'
               + (' …' if len(only_b) > 12 else ''))
-    print(dim(f'\n  детальный разбор региона: geotool.py diff <A> <B> --region XX_YY'))
+    print(dim(f'\n  детальный разбор региона: geotool.py diff <A> <B> --region <имя, напр. 23_18 или 23_18_Classic>'))
     return 2 if n_bad else 0

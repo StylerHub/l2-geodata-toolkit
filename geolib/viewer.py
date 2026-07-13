@@ -27,18 +27,21 @@ class ViewerState:
         self.locks = {}                     # путь → Lock: парсинг не блокирует чужие регионы
 
     def files(self):
+        # стем имени → путь; 27_24_Classic — отдельный регион от 27_24,
+        # координаты фронт берёт из первых двух чисел имени
         out = {}
         for f in sorted(glob.glob(os.path.join(self.primary, '*.l2j')) +
                         glob.glob(os.path.join(self.primary, '*_conv.dat'))):
-            m = re.match(r'^(\d+_\d+)(\.l2j|_conv\.dat)$', os.path.basename(f))
-            if m:
-                out.setdefault(m.group(1), f)
+            base = os.path.basename(f)
+            if not re.match(r'^\d+_\d+', base):
+                continue
+            stem = base[:-len('_conv.dat')] if base.endswith('_conv.dat') else base[:-len('.l2j')]
+            out.setdefault(stem, f)
         return out
 
     def parsed(self, name):
-        # канонические имена: XX_YY.l2j либо XX_YY_conv.dat
-        candidates = [os.path.join(self.primary, name + '.l2j'),
-                      os.path.join(self.primary, name + '_conv.dat')]
+        # имя региона → файл через files(): суффиксные имена тоже находятся
+        candidates = [p for p in [self.files().get(name)] if p]
         for p in candidates:
             if os.path.exists(p):
                 key = (p, os.path.getmtime(p))
