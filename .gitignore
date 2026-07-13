@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+geodata_backups/
+.DS_Store
+Thumbs.db
