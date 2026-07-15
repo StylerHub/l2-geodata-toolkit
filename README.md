@@ -63,7 +63,7 @@ python3 geotool.py verify <папка1> <папка2>   # сверка PTS ↔ L
 ## Генерация из клиента (`generate`)
 
 Строит геодату напрямую из файлов клиента L2 (нужны папки `Maps`,
-`Textures`, `StaticMeshes`). Без UnrealEd и HEX-редакторов.
+`Textures`, `StaticMeshes`).
 **Квадрат = имя файла карты в Maps**: `XX_YY.unr` и `XX_YY_Classic.unr` —
 отдельные квадраты, выбираются и генерятся раздельно по имени
 (`--region 23_18 23_18_Classic`). Выход плоский: `out/<имя>.l2j`.
